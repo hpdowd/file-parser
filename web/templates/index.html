@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Incident Report — Parser</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --txt:#e2e8f0;
+          --muted:#94a3b8; --accent:#2563eb; --ok:#16a34a; --warn:#d97706; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; color:var(--txt);
+         background:var(--bg); display:flex; min-height:100vh;
+         align-items:center; justify-content:center; padding:24px; }
+  .card { width:100%; max-width:540px; background:var(--panel);
+          border:1px solid var(--line); border-radius:14px; padding:28px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { margin:0 0 22px; color:var(--muted); font-size:13px; }
+  .drop { border:2px dashed var(--line); border-radius:10px; padding:30px 18px;
+          text-align:center; cursor:pointer; transition:.15s; }
+  .drop.over { border-color:var(--accent); background:#1d283e; }
+  .drop input { display:none; }
+  .fname { margin-top:12px; font-size:13px; color:var(--muted);
+           word-break:break-all; }
+  button { font:inherit; border:0; border-radius:8px; padding:11px 16px;
+           cursor:pointer; color:#fff; background:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--line);
+                 color:var(--txt); }
+  .row { display:flex; gap:10px; margin-top:18px; }
+  .row button { flex:1; }
+  #status { margin-top:16px; font-size:13px; min-height:20px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); }
+  .foot { margin-top:22px; font-size:12px; color:var(--muted);
+          border-top:1px solid var(--line); padding-top:14px; }
+  .hidden { display:none; }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid #fff5;
+          border-top-color:#fff; border-radius:50%; animation:s .7s linear infinite;
+          vertical-align:-2px; margin-right:6px; }
+  @keyframes s { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Incident Report → Spreadsheet</h1>
+  <p class="sub">Upload a <strong>text-based</strong> report export (PDF). It is
+     parsed in memory and never stored on the server.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept="application/pdf,.pdf">
+    <div>Drop the PDF here or <u>choose a file</u></div>
+    <div class="fname" id="fname"></div>
+  </label>
+
+  <div class="row">
+    <button id="parseBtn" disabled>Parse</button>
+  </div>
+
+  <div id="results" class="hidden">
+    <div class="row">
+      <button id="dlBtn" class="ghost">⬇ Download .xlsx</button>
+      <button id="printBtn">🖨 Print in office</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="foot">Processed entirely on the home server. Access is restricted;
+     no report data is retained after your download.</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const drop = $("drop"), fileInput = $("file");
+let pickedFile = null;        // the uploaded PDF
+let resultBlob = null;        // the parsed .xlsx, held only in this tab
+let resultName = "incidents.xlsx";
+
+function setStatus(msg, cls="") { const s=$("status"); s.className=cls; s.innerHTML=msg; }
+
+["dragover","dragenter"].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => {
+  ev.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", ev => {
+  if (ev.dataTransfer.files.length) { fileInput.files = ev.dataTransfer.files; pick(); }
+});
+fileInput.addEventListener("change", pick);
+
+function pick() {
+  pickedFile = fileInput.files[0] || null;
+  $("fname").textContent = pickedFile ? pickedFile.name : "";
+  $("parseBtn").disabled = !pickedFile;
+  $("results").classList.add("hidden");
+  resultBlob = null;
+  setStatus("");
+}
+
+$("parseBtn").addEventListener("click", async () => {
+  if (!pickedFile) return;
+  $("parseBtn").disabled = true;
+  setStatus('<span class="spin"></span>Parsing…');
+  try {
+    const fd = new FormData(); fd.append("file", pickedFile);
+    const res = await fetch("/parse", { method:"POST", body: fd });
+    if (!res.ok) { setStatus(await msgFrom(res), "warn"); return; }
+    resultBlob = await res.blob();
+    resultName = (pickedFile.name.replace(/\.pdf$/i,"")) + "-incidents.xlsx";
+    const rows = res.headers.get("X-Incident-Rows");
+    const skip = res.headers.get("X-Skipped-Pages");
+    $("results").classList.remove("hidden");
+    setStatus(`Parsed ${rows} incident(s)` +
+              (skip && skip!=="0" ? ` · ${skip} page(s) skipped` : "") +
+              ". Download or print below.", "ok");
+  } catch (e) {
+    setStatus("Network error: " + e.message, "warn");
+  } finally {
+    $("parseBtn").disabled = false;
+  }
+});
+
+$("dlBtn").addEventListener("click", () => {
+  if (!resultBlob) return;
+  const url = URL.createObjectURL(resultBlob);
+  const a = Object.assign(document.createElement("a"), { href:url, download:resultName });
+  a.click(); URL.revokeObjectURL(url);
+});
+
+$("printBtn").addEventListener("click", async () => {
+  if (!resultBlob) return;
+  $("printBtn").disabled = true;
+  setStatus('<span class="spin"></span>Sending to the office printer…');
+  try {
+    const fd = new FormData();
+    fd.append("file", new File([resultBlob], resultName,
+      { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    const res = await fetch("/print", { method:"POST", body: fd });
+    setStatus(res.ok ? "Sent to the printer." : await msgFrom(res),
+              res.ok ? "ok" : "warn");
+  } catch (e) {
+    setStatus("Network error: " + e.message, "warn");
+  } finally {
+    $("printBtn").disabled = false;
+  }
+});
+
+async function msgFrom(res) {
+  try { const j = await res.json(); return j.detail || j.message || ("Error " + res.status); }
+  catch { return "Error " + res.status; }
+}
+</script>
+</body>
+</html>

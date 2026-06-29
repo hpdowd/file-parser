@@ -1,0 +1,15 @@
+# Never bake data or local cruft into the image.
+*.pdf
+*.xlsx
+*.csv
+*.json
+!template.pdf
+.git
+.venv
+__pycache__/
+*.pyc
+*.odg
+k8s/
+DEPLOY.md
+STATUS.md
+README.md

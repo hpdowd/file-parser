@@ -1,0 +1,6 @@
+# Web front-end deps (the parser itself pins pdfplumber/openpyxl in its PEP 723 header).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pdfplumber>=0.11
+openpyxl>=3.1
