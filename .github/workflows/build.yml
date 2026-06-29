@@ -1,0 +1,57 @@
+name: Build and push image
+
+# The repo is pushed to Gitea first, then mirrored to GitHub. Gitea's Act runner
+# also reads .github/workflows, so without a guard it would try to build too. The
+# `if` below pins the build to github.com only: github.server_url is
+# "https://github.com" on GitHub, but the Gitea instance URL on Gitea — so on
+# Gitea the job is skipped and nothing builds there.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # >>> Build only on github.com (not on the Gitea Act runner). <<<
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # lets GITHUB_TOKEN push to GHCR (no PAT needed)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/hpdowd/file-parser
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha            # immutable sha-<short> tag to pin deployments to
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64   # k3s nodes are amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
