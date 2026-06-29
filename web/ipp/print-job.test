@@ -1,0 +1,19 @@
+# ipptool job template: submit one PDF to an IPP Everywhere printer.
+# $uri is the printer URI given on the command line; $filename is the -f argument.
+{
+	NAME "Print Incident Report"
+	OPERATION Print-Job
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR naturalLanguage attributes-natural-language en
+	ATTR uri printer-uri $uri
+	ATTR name requesting-user-name "file-parser"
+	ATTR name job-name "Incident Report"
+	ATTR mimeMediaType document-format application/pdf
+	GROUP job-attributes-tag
+	ATTR integer copies 1
+	FILE $filename
+	STATUS successful-ok
+	DISPLAY job-id
+	DISPLAY job-state
+}

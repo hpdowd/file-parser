@@ -1,0 +1,21 @@
+# Data files are excluded by default so report data is never committed.
+# Only the blank template is tracked, via an explicit force-add (git add -f).
+*.pdf
+*.odg
+*.xlsx
+*.csv
+*.json
+
+# Local-only project context / deployment notes — kept out of the public repo.
+STATUS.md
+DEPLOY.md
+*.local.md
+
+# LibreOffice lock files
+.~lock.*#
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
