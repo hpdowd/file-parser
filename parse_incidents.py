@@ -935,22 +935,19 @@ def write_xlsx(rows: list[dict], path: Path,
             n += f" (banner: {reported})"
         tail.append(n)
         fill = PatternFill("solid", fgColor=DIV_SHADE[level])
-        sz = DIV_SIZE[level]
-        white_run = InlineFont(rFont="Calibri", sz=sz, b=True, color=C_DIV_TXT)
-        value_run = InlineFont(rFont="Calibri", sz=sz, b=True, color=BANNER_VAL[level])
         for ci in range(1, ncols + 1):
             c = ws.cell(row=rr, column=ci)
             c.fill, c.border = fill, div_border
             if ci == 1:
-                # Indent signals nesting depth; the value is coloured (rich text) in
-                # this level's own colour so the important bit of each banner stands
-                # out and signals which level it is.
-                prefix = "   " * DIV_INDENT[level] + label + " "
-                c.value = CellRichText(
-                    TextBlock(white_run, prefix),
-                    TextBlock(value_run, value or "(none)"),
-                    TextBlock(white_run, "   ·   " + "   ·   ".join(tail)),
-                )
+                # Indent signals nesting depth. The whole bar is drawn with one
+                # cell-level font (white, bold, sized per level) rather than per-run
+                # rich text: inline rich text does NOT round-trip reliably through
+                # openpyxl, and LibreOffice (the print path) drops per-run
+                # formatting — both leave the bar looking like a plain data row.
+                indent = "   " * DIV_INDENT[level]
+                c.value = (indent + label + " " + (value or "(none)")
+                           + "   ·   " + "   ·   ".join(tail))
+                c.font = div_fonts[level]
                 c.alignment = Alignment(vertical="center", horizontal="left")
         ws.row_dimensions[rr].height = DIV_HEIGHT[level]
 
