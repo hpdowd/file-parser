@@ -705,6 +705,10 @@ def parse_files(paths: list[Path], debug: bool = False,
                         # which a Sec 19 incident is expected to leave blank. If it
                         # wasn't blank, append instead of overwrite and flag the cell
                         # (see write_xlsx) rather than silently discard what was read.
+                        # A Sec 19 station with NO match is flagged too — that's
+                        # either an unmapped station or a spelling gap in the map,
+                        # and either way the row got no auto-fill, so it needs a
+                        # human to look rather than pass silently.
                         if region_map and row.get("sec19") == "Yes":
                             station = current["grp_station"]
                             match = region_map.get(_norm(station).casefold())
@@ -718,11 +722,20 @@ def parse_files(paths: list[Path], debug: bool = False,
                                 else:
                                     row["investigating_member"] = f"{existing} / {member_name}"
                                     row["investigating_flag"] = "yes"
+                                    row["investigating_flag_detail"] = (
+                                        "Investigating Member was already populated "
+                                        "on this Sec 19 incident — the region name "
+                                        "was appended rather than overwriting it")
                             elif station:
                                 print(f"warning: {pdf_path.name} p{i}: Sec 19 "
                                       f"incident's Local Station {station!r} not "
                                       "found in region map — leaving unchanged",
                                       file=sys.stderr)
+                                row["investigating_flag"] = "yes"
+                                row["investigating_flag_detail"] = (
+                                    f"Sec 19 incident's Local Station {station!r} "
+                                    "wasn't matched to a region — no auto-fill "
+                                    "applied, please check")
 
                         rows.append(row)
                     except Exception as exc:
@@ -1001,12 +1014,17 @@ def write_xlsx(rows: list[dict], path: Path,
                 cell.number_format = "€#,##0.00"
 
             # A Sec 19 incident normally leaves Investigating Member blank; region
-            # matching (see parse_files) only appends its mapped name onto a
-            # non-blank value, and flags the cell here — same red as a Check
-            # discrepancy — so the unexpected pre-existing content stays visible.
+            # matching (see parse_files) flags this cell — same red as a Check
+            # discrepancy, with the reason on hover — either when it wasn't blank
+            # (name appended rather than overwritten) or when the Local Station
+            # banner couldn't be matched to any region (no auto-fill happened).
             if key == "investigating_member" and \
                     _norm(str(r.get("investigating_flag", ""))) == "yes":
                 cell.fill, cell.font = chk_fill, chk_font
+                detail = _norm(str(r.get("investigating_flag_detail", ""))) \
+                    or "Sec 19 region match anomaly"
+                cm = Comment(detail, "parser"); cm.width, cm.height = 260, 80
+                cell.comment = cm
             # The key field (Incident No.) gets a persistent gold lane + bold/larger
             # text so the eye lands on it; an empty one still flags amber.
             elif key in EMPHASIS:
