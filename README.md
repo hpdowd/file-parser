@@ -94,7 +94,12 @@ uv run parse_incidents.py INPUT [INPUT ...] [options]
   --self-test           parse the bundled template.pdf and check every *** cell
   --region-map FILE     station -> region code/name map, applied to Sec 19
                         incidents only (auto-detected next to the script if
-                        present; see load_region_map() for the file format)
+                        present, encrypted preferred over plaintext; see
+                        parse_region_map() for the file format). A station
+                        with no match is flagged for review, not skipped.
+  --encrypt-region-map [FILE]
+                        encrypt FILE (default: region_stations.md) to
+                        FILE.enc with a passphrase, then exit
 ```
 
 ## Adding more fields
