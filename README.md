@@ -92,6 +92,9 @@ uv run parse_incidents.py INPUT [INPUT ...] [options]
   --inspect             privacy-safe structural report (every value masked)
   --diagnose            check whether the PDF's text is actually extractable
   --self-test           parse the bundled template.pdf and check every *** cell
+  --region-map FILE     station -> region code/name map, applied to Sec 19
+                        incidents only (auto-detected next to the script if
+                        present; see load_region_map() for the file format)
 ```
 
 ## Adding more fields
