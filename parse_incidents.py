@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pdfplumber>=0.11", "openpyxl>=3.1"]
+# dependencies = ["pdfplumber>=0.11", "openpyxl>=3.1", "cryptography>=42"]
 # ///
 """
 parse_incidents.py
@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -514,6 +516,71 @@ def extract_banners(pv: PageView) -> dict:
     return out
 
 
+def parse_region_map(text: str) -> dict[str, tuple[str, str]]:
+    """Parse a region/station map (Markdown): '# Region' headings, each followed
+    by a '> CODE - Name' line and a bullet list of every station in that region
+    ('- Station'). Returns {station_name_casefolded: (code, name)} for matching
+    against the Local Station banner value. See region_stations.md (local-only,
+    gitignored) for the format and real data."""
+    mapping: dict[str, tuple[str, str]] = {}
+    code = name = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            code = name = ""
+        elif line.startswith(">"):
+            m = re.match(r">\s*(\S+)\s*-\s*(.+)$", line)
+            if m:
+                code, name = m.group(1), m.group(2).strip()
+        elif line.startswith("-") and code:
+            mapping[_norm(line[1:]).casefold()] = (code, name)
+    return mapping
+
+
+def load_region_map(path: Path) -> dict[str, tuple[str, str]]:
+    """Load a PLAINTEXT region map file. Prefer encrypt_region_map/
+    decrypt_region_map for anything kept on disk long-term — see main()'s
+    --encrypt-region-map, which keeps the real names/codes out of plaintext."""
+    return parse_region_map(path.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+#  Region map at-rest encryption — so the real station/region names and codes  #
+#  are never sitting in plaintext on disk between runs. Passphrase-based:      #
+#  scrypt derives a key from the passphrase + a random salt (stored alongside  #
+#  the ciphertext), AES-256-GCM encrypts (authenticated, so a wrong passphrase #
+#  or corrupted file fails loudly instead of silently returning garbage).      #
+#  File layout: 16-byte salt | 12-byte nonce | ciphertext (GCM tag included).  #
+# --------------------------------------------------------------------------- #
+def _region_map_key(passphrase: str, salt: bytes) -> bytes:
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    return Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(passphrase.encode())
+
+
+def encrypt_region_map(src: Path, dest: Path, passphrase: str) -> None:
+    """Encrypt the plaintext region map at `src` to `dest`."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    salt, nonce = os.urandom(16), os.urandom(12)
+    key = _region_map_key(passphrase, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, src.read_bytes(), None)
+    dest.write_bytes(salt + nonce + ciphertext)
+
+
+def decrypt_region_map(path: Path, passphrase: str) -> dict[str, tuple[str, str]]:
+    """Decrypt an encrypted region map and parse it. Raises ValueError on a wrong
+    passphrase or corrupted file (never returns partial/garbage data)."""
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    data = path.read_bytes()
+    salt, nonce, ciphertext = data[:16], data[16:28], data[28:]
+    key = _region_map_key(passphrase, salt)
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    except InvalidTag:
+        raise ValueError("wrong passphrase, or the file is corrupted")
+    return parse_region_map(plaintext.decode("utf-8"))
+
+
 def extract_page(pv: PageView, source: str, page_no: int, debug: bool = False) -> dict:
     row: dict = {"source_file": source, "page": page_no}
     for f in FIELDS:
@@ -547,12 +614,18 @@ def iter_pdf_paths(inputs: list[str]) -> list[Path]:
     return paths
 
 
-def parse_files(paths: list[Path],
-                debug: bool = False) -> tuple[list[dict], list[dict]]:
+def parse_files(paths: list[Path], debug: bool = False,
+                region_map: Optional[dict[str, tuple[str, str]]] = None
+                ) -> tuple[list[dict], list[dict]]:
     """Returns (rows, skipped). `skipped` lists the continuation/non-incident pages
     that were NOT extracted — {source_file, page, source_path} — so a reviewer can
     open each one (the xlsx 'Skipped Pages' sheet links them) and confirm nothing
-    real was dropped."""
+    real was dropped.
+
+    `region_map` (see load_region_map) is optional and applies ONLY to Sec 19
+    incidents: when the row's Local Station banner matches a mapped station, its
+    region code is appended to the banner and the mapped name is filled into
+    Investigating Member (which a Sec 19 incident normally leaves blank)."""
     rows: list[dict] = []
     skipped: list[dict] = []
     for pdf_path in paths:
@@ -625,6 +698,32 @@ def parse_files(paths: list[Path],
                         row["check"] = "yes" if issues else ""
                         row["check_detail"] = "; ".join(issues)
                         row["review_station"] = review or row.get("review_station", "")
+
+                        # Region matching (Sec 19 only, see load_region_map): the
+                        # Local Station banner's region code is appended to the
+                        # banner value; the mapped name fills Investigating Member,
+                        # which a Sec 19 incident is expected to leave blank. If it
+                        # wasn't blank, append instead of overwrite and flag the cell
+                        # (see write_xlsx) rather than silently discard what was read.
+                        if region_map and row.get("sec19") == "Yes":
+                            station = current["grp_station"]
+                            match = region_map.get(_norm(station).casefold())
+                            if match:
+                                code, member_name = match
+                                row["grp_station"] = f"{station} {code}"
+                                row["grp_station_n"] = ""  # split off the banner's count
+                                existing = _norm(row.get("investigating_member", ""))
+                                if not existing or _is_no_data(existing):
+                                    row["investigating_member"] = member_name
+                                else:
+                                    row["investigating_member"] = f"{existing} / {member_name}"
+                                    row["investigating_flag"] = "yes"
+                            elif station:
+                                print(f"warning: {pdf_path.name} p{i}: Sec 19 "
+                                      f"incident's Local Station {station!r} not "
+                                      "found in region map — leaving unchanged",
+                                      file=sys.stderr)
+
                         rows.append(row)
                     except Exception as exc:
                         print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
@@ -901,9 +1000,16 @@ def write_xlsx(rows: list[dict], path: Path,
             if key in RIGHT and isinstance(value, (int, float)):
                 cell.number_format = "€#,##0.00"
 
+            # A Sec 19 incident normally leaves Investigating Member blank; region
+            # matching (see parse_files) only appends its mapped name onto a
+            # non-blank value, and flags the cell here — same red as a Check
+            # discrepancy — so the unexpected pre-existing content stays visible.
+            if key == "investigating_member" and \
+                    _norm(str(r.get("investigating_flag", ""))) == "yes":
+                cell.fill, cell.font = chk_fill, chk_font
             # The key field (Incident No.) gets a persistent gold lane + bold/larger
             # text so the eye lands on it; an empty one still flags amber.
-            if key in EMPHASIS:
+            elif key in EMPHASIS:
                 cell.font = key_font
                 cell.fill = blank_fill if raw == "" else key_fill
             # Colour, most specific first: empty cells (amber, possible gap), then
@@ -1428,10 +1534,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--diagnose", action="store_true",
                     help="check whether a PDF's text is actually extractable "
                          "(scan/OCR/encoding health) — safe to share, no content")
+    ap.add_argument("--region-map", metavar="FILE",
+                    help="Local Station -> region code/name map for Sec 19 "
+                         "incidents — plaintext or an --encrypt-region-map output "
+                         "(see parse_region_map for the format); auto-detected next "
+                         "to this script if present (encrypted preferred over "
+                         "plaintext), otherwise the feature is off")
+    ap.add_argument("--encrypt-region-map", metavar="FILE", nargs="?",
+                    const="region_stations.md",
+                    help="encrypt FILE (default: region_stations.md) to FILE.enc "
+                         "with a passphrase, then exit — delete the plaintext "
+                         "original yourself once the encrypted copy loads correctly")
     args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test()
+
+    if args.encrypt_region_map:
+        src = Path(args.encrypt_region_map)
+        if not src.exists():
+            ap.error(f"--encrypt-region-map: {src} not found")
+        p1 = getpass.getpass(f"Passphrase for {src.name}: ")
+        p2 = getpass.getpass("Confirm passphrase: ")
+        if not p1:
+            print("error: empty passphrase", file=sys.stderr)
+            return 1
+        if p1 != p2:
+            print("error: passphrases did not match", file=sys.stderr)
+            return 1
+        dest = src.with_name(src.name + ".enc")
+        encrypt_region_map(src, dest, p1)
+        print(f"Encrypted -> {dest}\n"
+              f"Verify it loads (--region-map {dest}), then delete the plaintext "
+              f"{src} yourself — it is not removed automatically.")
+        return 0
 
     if not args.inputs:
         ap.error("no inputs given (provide PDF files/folders, or use --self-test)")
@@ -1447,8 +1583,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.diagnose:
         return diagnose_files(paths)
 
+    region_map = None
+    if args.region_map:
+        region_map_path = Path(args.region_map)
+        if not region_map_path.exists():
+            ap.error(f"--region-map file not found: {region_map_path}")
+    else:
+        here = Path(__file__).resolve().parent
+        enc, plain = here / "region_stations.md.enc", here / "region_stations.md"
+        region_map_path = enc if enc.exists() else (plain if plain.exists() else None)
+
+    if region_map_path is not None:
+        if region_map_path.suffix == ".enc":
+            passphrase = getpass.getpass(f"Passphrase for {region_map_path.name}: ")
+            try:
+                region_map = decrypt_region_map(region_map_path, passphrase)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            print(f"warning: {region_map_path} is unencrypted plaintext on disk "
+                  "— consider --encrypt-region-map", file=sys.stderr)
+            region_map = load_region_map(region_map_path)
+        print(f"Using region map: {region_map_path} ({len(region_map)} station(s))")
+
     print(f"Parsing {len(paths)} PDF file(s)…")
-    rows, skipped = parse_files(paths, debug=args.debug)
+    rows, skipped = parse_files(paths, debug=args.debug, region_map=region_map)
     if not rows:
         print("error: nothing extracted", file=sys.stderr)
         return 1

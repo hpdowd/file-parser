@@ -43,6 +43,11 @@ IPP_TEMPLATE = Path(__file__).parent / "ipp" / "print-job.test"
 SOFFICE_BIN = os.environ.get("SOFFICE_BIN", "soffice")
 SOFFICE_TIMEOUT = int(os.environ.get("SOFFICE_TIMEOUT", "120"))
 PRINT_TIMEOUT = int(os.environ.get("PRINT_TIMEOUT", "60"))
+# Optional Sec 19 region map (see parse_incidents.load_region_map). Not baked into
+# the image or this repo — supplied at deploy time as a mounted Secret file, so
+# the real station/region names never appear in either public repo or the public
+# image. Absent by default: the feature is then simply off.
+REGION_MAP_PATH = Path(os.environ.get("REGION_MAP_PATH", "/etc/region-map/region_stations.md"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("file-parser-web")
@@ -50,6 +55,17 @@ log = logging.getLogger("file-parser-web")
 app = FastAPI(title="Incident report parser", docs_url=None, redoc_url=None)
 
 _INDEX_HTML = (Path(__file__).parent / "templates" / "index.html").read_text()
+
+# Loaded once at startup, not per-request: a mounted Secret file doesn't change
+# without a pod restart anyway (same as the ConfigMap-sourced env vars above).
+# Never logs the map's contents, only its size, matching the CLI's own logging.
+REGION_MAP: dict[str, tuple[str, str]] | None = None
+if REGION_MAP_PATH.exists():
+    try:
+        REGION_MAP = parser.load_region_map(REGION_MAP_PATH)
+        log.info("region map loaded: %d station(s)", len(REGION_MAP))
+    except Exception:
+        log.exception("failed to load region map from %s — feature disabled", REGION_MAP_PATH)
 
 
 def _who(request: Request) -> str:
@@ -113,7 +129,7 @@ async def parse(request: Request, file: UploadFile) -> Response:
         pdf_path = Path(work) / "input.pdf"
         size = await _save_upload(file, pdf_path)
 
-        rows, skipped = parser.parse_files([pdf_path])
+        rows, skipped = parser.parse_files([pdf_path], region_map=REGION_MAP)
         if not rows:
             raise HTTPException(
                 422,
