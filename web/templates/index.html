@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Incident Report — Parser</title>
-<style>
+<style nonce="__CSP_NONCE__">
   :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --txt:#e2e8f0;
           --muted:#94a3b8; --accent:#2563eb; --ok:#16a34a; --warn:#d97706; }
   * { box-sizing: border-box; }
@@ -68,12 +68,13 @@
      no report data is retained after your download.</div>
 </div>
 
-<script>
+<script nonce="__CSP_NONCE__">
 const $ = id => document.getElementById(id);
 const drop = $("drop"), fileInput = $("file");
 let pickedFile = null;        // the uploaded PDF
 let resultBlob = null;        // the parsed .xlsx, held only in this tab
 let resultName = "incidents.xlsx";
+let resultToken = "";         // HMAC binding this .xlsx to /print (see /parse)
 
 function setStatus(msg, cls="") { const s=$("status"); s.className=cls; s.innerHTML=msg; }
 
@@ -92,6 +93,7 @@ function pick() {
   $("parseBtn").disabled = !pickedFile;
   $("results").classList.add("hidden");
   resultBlob = null;
+  resultToken = "";
   setStatus("");
 }
 
@@ -104,6 +106,7 @@ $("parseBtn").addEventListener("click", async () => {
     const res = await fetch("/parse", { method:"POST", body: fd });
     if (!res.ok) { setStatus(await msgFrom(res), "warn"); return; }
     resultBlob = await res.blob();
+    resultToken = res.headers.get("X-Print-Token") || "";
     resultName = (pickedFile.name.replace(/\.pdf$/i,"")) + "-incidents.xlsx";
     const rows = res.headers.get("X-Incident-Rows");
     const skip = res.headers.get("X-Skipped-Pages");
@@ -133,6 +136,7 @@ $("printBtn").addEventListener("click", async () => {
     const fd = new FormData();
     fd.append("file", new File([resultBlob], resultName,
       { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    fd.append("token", resultToken);
     const res = await fetch("/print", { method:"POST", body: fd });
     setStatus(res.ok ? "Sent to the printer." : await msgFrom(res),
               res.ok ? "ok" : "warn");

@@ -8,24 +8,44 @@ Design:
               LibreOffice headless and send it to the network printer over IPP.
               Again a per-request temp dir, deleted afterwards.
   * /        - the single-page UI.
-  * /healthz - liveness/readiness for Kubernetes.
+  * /healthz - liveness/readiness for Kubernetes (unauthenticated).
 
 Privacy: this handles sensitive personal data. We never write outside a private
 per-request temp dir, never log file *contents*, and strip the parser's internal
-`source_path` so no server-side path leaks into the .xlsx hyperlinks. Access
-control (identity) is enforced *in front* by an auth proxy — not here.
+`source_path` so no server-side path leaks into the .xlsx hyperlinks.
+
+Security (see SECURITY.md for the full model):
+  * Identity is enforced *in front* by an auth proxy (Cloudflare Access). As defence
+    in depth this app can ALSO verify the Access JWT itself (set ACCESS_TEAM_DOMAIN
+    + ACCESS_AUD) so a request that reaches the pod directly — bypassing the proxy —
+    is still rejected. Disabled by default; a warning is logged when off. (H2)
+  * /print only accepts a workbook THIS server produced: /parse returns an HMAC over
+    the bytes and /print re-checks it before the file touches openpyxl/LibreOffice,
+    so no arbitrary document can be fed to LibreOffice. (M1)
+  * Concurrency for the CPU/subprocess-heavy work is capped, and child processes run
+    in their own group so a timeout kills the whole tree. (M2)
+  * Formula/CSV injection in the produced workbook is neutralised in the parser
+    (parse_incidents._formula_safe); relevant because /print renders it through
+    LibreOffice. (H1)
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import logging
 import os
+import re
+import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 # The parser lives at the repo root, one level above this file's directory.
@@ -36,8 +56,9 @@ import parse_incidents as parser  # noqa: E402
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # Direct IPP Everywhere endpoint of the network printer, e.g.
-# "ipp://<printer-host>/ipp/print". Printing straight to the printer means we don't
-# depend on any intermediate CUPS host being powered on.
+# "ipp://<printer-host>/ipp/print" (or "ipps://…" for TLS on the wire — preferred
+# for sensitive output). Printing straight to the printer means we don't depend on
+# any intermediate CUPS host being powered on.
 PRINTER_URI = os.environ.get("PRINTER_URI", "")
 IPP_TEMPLATE = Path(__file__).parent / "ipp" / "print-job.test"
 SOFFICE_BIN = os.environ.get("SOFFICE_BIN", "soffice")
@@ -49,8 +70,67 @@ PRINT_TIMEOUT = int(os.environ.get("PRINT_TIMEOUT", "60"))
 # image. Absent by default: the feature is then simply off.
 REGION_MAP_PATH = Path(os.environ.get("REGION_MAP_PATH", "/etc/region-map/region_stations.md"))
 
+# Cap concurrent CPU/subprocess-heavy work (pdfplumber parse, LibreOffice render) so
+# a burst of large/complex uploads can't exhaust the pod; requests queue on the
+# semaphore. k8s resource limits are the outer bound. (M2)
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
+_WORK_SEM = asyncio.Semaphore(MAX_CONCURRENCY)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("file-parser-web")
+
+# ---- /print binding key (M1) -------------------------------------------------
+# Prefer a stable key (survives restarts / works across replicas); otherwise a
+# per-process key — fine for a single replica, but a workbook downloaded before a
+# restart then can't be printed (just re-parse).
+_key_env = os.environ.get("PRINT_SIGNING_KEY", "").encode()
+_EPHEMERAL_PRINT_KEY = not _key_env
+_PRINT_KEY = _key_env or secrets.token_bytes(32)
+if _EPHEMERAL_PRINT_KEY:
+    log.warning("PRINT_SIGNING_KEY not set — using an ephemeral per-process print "
+                "token key (ok for a single replica; set it for multi-replica or "
+                "print-after-restart).")
+
+# ---- optional Cloudflare Access JWT verification (H2) -------------------------
+ACCESS_TEAM_DOMAIN = os.environ.get("ACCESS_TEAM_DOMAIN", "").strip().rstrip("/")
+ACCESS_AUD = os.environ.get("ACCESS_AUD", "").strip()
+ACCESS_ENABLED = bool(ACCESS_TEAM_DOMAIN and ACCESS_AUD)
+_ISSUER = ACCESS_TEAM_DOMAIN if ACCESS_TEAM_DOMAIN.startswith("http") else f"https://{ACCESS_TEAM_DOMAIN}"
+_jwk_client = None
+if ACCESS_ENABLED:
+    # Fail closed: if verification was explicitly requested but the library is
+    # missing/misconfigured, refuse to start rather than run without the check.
+    from jwt import PyJWKClient  # noqa: E402  (raises at import if PyJWT absent)
+    _jwk_client = PyJWKClient(f"{_ISSUER}/cdn-cgi/access/certs")  # caches keys itself
+    log.info("Cloudflare Access JWT verification ENABLED (issuer=%s)", _ISSUER)
+else:
+    log.warning("Cloudflare Access JWT verification DISABLED — relying solely on the "
+                "auth proxy + NetworkPolicy in front. Set ACCESS_TEAM_DOMAIN + "
+                "ACCESS_AUD to enable in-app verification.")
+
+
+def _verify_access(request: Request) -> str:
+    """Return the authenticated email. When Access verification is enabled, the
+    Cloudflare Access JWT is cryptographically verified (signature, audience,
+    issuer); a missing/invalid assertion is rejected. When disabled, fall back to
+    the (untrusted) header Cloudflare injects — usable for local dev, but see the
+    startup warning."""
+    if not ACCESS_ENABLED:
+        return request.headers.get("Cf-Access-Authenticated-User-Email", "anonymous")
+    import jwt
+    token = (request.headers.get("Cf-Access-Jwt-Assertion")
+             or request.cookies.get("CF_Authorization"))
+    if not token:
+        raise HTTPException(401, "Missing Cloudflare Access assertion.")
+    try:
+        key = _jwk_client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(token, key, algorithms=["RS256"],
+                            audience=ACCESS_AUD, issuer=_ISSUER)
+    except Exception as exc:  # signature / aud / issuer / expiry / fetch failure
+        log.warning("Access JWT rejected: %s", exc.__class__.__name__)
+        raise HTTPException(401, "Invalid Cloudflare Access assertion.")
+    return claims.get("email") or claims.get("common_name") or "authenticated"
+
 
 app = FastAPI(title="Incident report parser", docs_url=None, redoc_url=None)
 
@@ -68,14 +148,58 @@ if REGION_MAP_PATH.exists():
         log.exception("failed to load region map from %s — feature disabled", REGION_MAP_PATH)
 
 
-def _who(request: Request) -> str:
-    """Identity for audit logging — set by Cloudflare Access in front of us."""
-    return request.headers.get("Cf-Access-Authenticated-User-Email", "anonymous")
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Set response security headers, incl. a per-request CSP nonce the index page
+    stamps into its inline <style>/<script> so no 'unsafe-inline' is needed. (L3)"""
+    nonce = secrets.token_urlsafe(16)
+    request.state.csp_nonce = nonce
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    return response
 
 
 def _private_tmpdir() -> str:
     """A 0700 temp dir for one request's files; caller must rmtree it."""
     return tempfile.mkdtemp(prefix="fp-")
+
+
+def _safe_download_name(name: str) -> str:
+    """A filesystem/header-safe download name derived from the upload, so the
+    user-controlled filename can't break the Content-Disposition header (CR/LF,
+    embedded quotes) or trip latin-1 encoding (non-ASCII → 500). (L1)"""
+    stem = Path(name).stem or "report"
+    stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "report"
+    return f"{stem[:100]}-incidents.xlsx"
+
+
+def _run(cmd: list[str], timeout: int, **kwargs):
+    """Run a subprocess in its own session/process group so a timeout can kill the
+    whole tree — LibreOffice forks soffice.bin, which subprocess.run's timeout would
+    orphan. Returns (returncode, stdout, stderr); re-raises TimeoutExpired. (M2)"""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True, **kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.communicate()
+        raise
+    return proc.returncode, out, err
 
 
 PRINT_SHEET = "Incidents"
@@ -110,8 +234,8 @@ async def _save_upload(upload: UploadFile, dest: Path) -> int:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    return HTMLResponse(_INDEX_HTML)
+async def index(request: Request) -> HTMLResponse:
+    return HTMLResponse(_INDEX_HTML.replace("__CSP_NONCE__", request.state.csp_nonce))
 
 
 @app.get("/healthz")
@@ -120,7 +244,8 @@ async def healthz() -> JSONResponse:
 
 
 @app.post("/parse")
-async def parse(request: Request, file: UploadFile) -> Response:
+async def parse(request: Request, file: UploadFile,
+                user: str = Depends(_verify_access)) -> Response:
     name = file.filename or "report.pdf"
     if not name.lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a .pdf export of the report.")
@@ -129,7 +254,8 @@ async def parse(request: Request, file: UploadFile) -> Response:
         pdf_path = Path(work) / "input.pdf"
         size = await _save_upload(file, pdf_path)
 
-        rows, skipped = parser.parse_files([pdf_path], region_map=REGION_MAP)
+        async with _WORK_SEM:
+            rows, skipped = parser.parse_files([pdf_path], region_map=REGION_MAP)
         if not rows:
             raise HTTPException(
                 422,
@@ -150,17 +276,20 @@ async def parse(request: Request, file: UploadFile) -> Response:
         parser.write_xlsx(rows, out_path, skipped)
         data = out_path.read_bytes()
 
-        log.info("parse user=%s in=%dB rows=%d skipped=%d out=%dB",
-                 _who(request), size, len(rows), len(skipped), len(data))
+        # Bind this workbook to /print (M1): the browser must send this token back.
+        token = hmac.new(_PRINT_KEY, data, hashlib.sha256).hexdigest()
 
-        download_name = Path(name).stem + "-incidents.xlsx"
+        log.info("parse user=%s in=%dB rows=%d skipped=%d out=%dB",
+                 user, size, len(rows), len(skipped), len(data))
+
         return Response(
             content=data,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
-                "Content-Disposition": f'attachment; filename="{download_name}"',
+                "Content-Disposition": f'attachment; filename="{_safe_download_name(name)}"',
                 "X-Incident-Rows": str(len(rows)),
                 "X-Skipped-Pages": str(len(skipped)),
+                "X-Print-Token": token,
             },
         )
     finally:
@@ -168,7 +297,8 @@ async def parse(request: Request, file: UploadFile) -> Response:
 
 
 @app.post("/print")
-async def print_xlsx(request: Request, file: UploadFile) -> JSONResponse:
+async def print_xlsx(request: Request, file: UploadFile, token: str = Form(""),
+                     user: str = Depends(_verify_access)) -> JSONResponse:
     if not PRINTER_URI:
         raise HTTPException(503, "Printing is not configured on this server.")
     work = _private_tmpdir()
@@ -176,38 +306,55 @@ async def print_xlsx(request: Request, file: UploadFile) -> JSONResponse:
         xlsx_path = Path(work) / "incidents.xlsx"
         await _save_upload(file, xlsx_path)
 
-        # Print the "Incidents" sheet only — LibreOffice renders every sheet, so
-        # drop the rest from a throwaway copy first (Summary/Legend/Discrepancies/
-        # Skipped Pages are for on-screen review, not the printout). The user's
-        # downloaded workbook is untouched; this copy exists only to print.
-        xlsx_path = _incidents_only(xlsx_path)
+        # M1: only ever print a workbook this server produced. Verify the HMAC the
+        # browser got from /parse BEFORE the file touches openpyxl or LibreOffice,
+        # so an attacker (past the auth proxy) can't feed an arbitrary document to
+        # LibreOffice. Constant-time compare; reject if absent/mismatched.
+        data = xlsx_path.read_bytes()
+        expected = hmac.new(_PRINT_KEY, data, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, token or ""):
+            log.warning("print rejected (bad/absent token) user=%s", user)
+            raise HTTPException(
+                403, "This file was not produced by this server, or the session "
+                "expired. Please re-parse the PDF and print again.")
 
-        # Render the print-first workbook to PDF. A throwaway LibreOffice profile
-        # per call keeps concurrent requests from fighting over one user profile.
-        profile = Path(work) / "lo-profile"
-        conv = subprocess.run(
-            [SOFFICE_BIN, "--headless", "--norestore",
-             f"-env:UserInstallation=file://{profile}",
-             "--convert-to", "pdf", "--outdir", work, str(xlsx_path)],
-            capture_output=True, text=True, timeout=SOFFICE_TIMEOUT,
-            env={**os.environ, "HOME": work},
-        )
-        pdf_path = xlsx_path.with_suffix(".pdf")
-        if conv.returncode != 0 or not pdf_path.exists():
-            log.error("soffice failed: %s", conv.stderr.strip())
-            raise HTTPException(500, "Could not render the workbook for printing.")
+        async with _WORK_SEM:
+            # Print the "Incidents" sheet only — LibreOffice renders every sheet, so
+            # drop the rest from a throwaway copy first. The user's downloaded
+            # workbook is untouched; this copy exists only to print.
+            xlsx_path = _incidents_only(xlsx_path)
 
-        # Submit the PDF straight to the printer's IPP endpoint. ipptool returns
-        # non-zero unless the Print-Job's STATUS expectation (successful-ok) is met.
-        pr = subprocess.run(
-            ["ipptool", "-tv", "-f", str(pdf_path), PRINTER_URI, str(IPP_TEMPLATE)],
-            capture_output=True, text=True, timeout=PRINT_TIMEOUT,
-        )
-        if pr.returncode != 0:
-            log.error("ipptool failed: %s", (pr.stderr or pr.stdout).strip())
-            raise HTTPException(502, "The printer rejected the job.")
+            # Render to PDF. A throwaway LibreOffice profile per call keeps concurrent
+            # requests from fighting over one user profile; HOME is the temp dir.
+            profile = Path(work) / "lo-profile"
+            try:
+                rc, _out, err = _run(
+                    [SOFFICE_BIN, "--headless", "--norestore",
+                     f"-env:UserInstallation=file://{profile}",
+                     "--convert-to", "pdf", "--outdir", work, str(xlsx_path)],
+                    timeout=SOFFICE_TIMEOUT, env={**os.environ, "HOME": work})
+            except subprocess.TimeoutExpired:
+                log.error("soffice timed out after %ss", SOFFICE_TIMEOUT)
+                raise HTTPException(504, "Rendering the workbook timed out.")
+            pdf_path = xlsx_path.with_suffix(".pdf")
+            if rc != 0 or not pdf_path.exists():
+                log.error("soffice failed: %s", (err or "").strip())
+                raise HTTPException(500, "Could not render the workbook for printing.")
 
-        log.info("print user=%s printer=%s ok", _who(request), PRINTER_URI)
+            # Submit the PDF straight to the printer's IPP endpoint. ipptool returns
+            # non-zero unless the Print-Job's STATUS expectation (successful-ok) holds.
+            try:
+                prc, pout, perr = _run(
+                    ["ipptool", "-tv", "-f", str(pdf_path), PRINTER_URI, str(IPP_TEMPLATE)],
+                    timeout=PRINT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                log.error("ipptool timed out after %ss", PRINT_TIMEOUT)
+                raise HTTPException(504, "The printer did not respond in time.")
+            if prc != 0:
+                log.error("ipptool failed: %s", (perr or pout).strip())
+                raise HTTPException(502, "The printer rejected the job.")
+
+        log.info("print user=%s printer=%s ok", user, PRINTER_URI)
         return JSONResponse({"status": "queued", "detail": "Sent to the printer."})
     finally:
         shutil.rmtree(work, ignore_errors=True)

@@ -1,6 +1,10 @@
 # Web front-end deps (the parser itself pins pdfplumber/openpyxl in its PEP 723 header).
+# NOTE: these are floors. For reproducible, tamper-evident images, generate a
+# hash-pinned lockfile (e.g. `uv pip compile --generate-hashes`) and install with
+# `pip install --require-hashes` in the Dockerfile. See SECURITY.md → Supply chain.
 fastapi>=0.115
 uvicorn[standard]>=0.30
-python-multipart>=0.0.9
+python-multipart>=0.0.18   # >=0.0.18 fixes the multipart DoS (CVE-2024-53981)
 pdfplumber>=0.11
 openpyxl>=3.1
+pyjwt[crypto]>=2.9         # optional in-app Cloudflare Access JWT verification (H2)

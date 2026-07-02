@@ -123,3 +123,14 @@ The new column flows through to xlsx/csv/json automatically.
 - **Validate on real data:** verified against the bundled template and rendered
   pages with realistic values, but real reports may have edge cases. Run `--debug`
   on a handful of real pages first and confirm the values look right.
+
+## Security
+
+Values from an uploaded PDF are treated as untrusted: they are neutralised against
+spreadsheet/CSV formula injection before being written. The optional web service is
+stateless (per-request temp dir, nothing persisted), enforces an upload size cap and
+a concurrency limit, binds its Print action to server-produced output, sets strict
+response security headers, and can verify the identity proxy's signed assertion
+itself. The region map can be encrypted at rest (AES-256-GCM). No report data is ever
+committed. See [SECURITY.md](SECURITY.md) for the full model, configuration, and a
+deployment hardening checklist.
