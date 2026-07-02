@@ -70,10 +70,13 @@ hidden text layer underneath** — open the result, check it, then share it.
   read once and rendered as nested coloured dividers (and filled down as hidden
   group columns in CSV/JSON).
 - **Print-first `.xlsx`.** The workbook has five sheets — Summary, the main rows,
-  Legend, Discrepancies, and Skipped Pages — styled for printing/review: nested
-  dividers, sparse colour for only the noteworthy cells, amber for unreadable cells
-  vs grey for recorded "no data", and per-page hyperlinks back to the source PDF.
-  CSV/JSON stay flat and keep the full column set.
+  Legend, Discrepancies, and Skipped Pages — styled for printing/review and
+  **ink-light**: solid fills mark only the noteworthy cells (flags, gaps,
+  "yes" indicators), while headers and the nested dividers use coloured text and
+  border rules on white, so printing spends toner only where something needs
+  attention. Amber marks unreadable cells vs grey italics for recorded "no data";
+  per-page hyperlinks lead back to the source PDF. CSV/JSON stay flat and keep the
+  full column set.
 
 ### Printing
 

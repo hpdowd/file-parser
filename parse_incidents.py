@@ -66,6 +66,26 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+# Characters that make a spreadsheet/CSV cell be parsed as a *formula* by
+# Excel/LibreOffice. openpyxl turns a leading "=" into a live formula outright,
+# and the web service's print path renders the workbook through LibreOffice, which
+# would then evaluate it — so an extracted value like `=WEBSERVICE("http://…")`
+# becomes server-side SSRF/exfiltration (and client-side execution when the file is
+# opened). See SECURITY.md → "Formula injection".
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def _formula_safe(value):
+    """Neutralise formula/CSV injection in a *data-derived* cell: if the value is a
+    string that begins with a formula-trigger character, prefix a single quote so it
+    is always stored and shown as text. Numbers and other types pass through
+    untouched (legitimate incident data never starts with these characters, so this
+    only ever fires on hostile input)."""
+    if isinstance(value, str) and value[:1] in _FORMULA_LEAD:
+        return "'" + value
+    return value
+
+
 def _same(a: str, b: str) -> bool:
     """Case-insensitive, whitespace-insensitive equality (for banner cross-checks)."""
     return _norm(str(a)).casefold() == _norm(str(b)).casefold()
@@ -819,10 +839,13 @@ def write_xlsx(rows: list[dict], path: Path,
     every row, so each row stays self-describing. (If no banners are detected it
     falls back to a flat, filterable table.)
 
-    Styling: zebra row banding, the binary Sec 19 / Supp. Role columns shown as
-    coloured ✓/✗ (a distinct palette per column), amber for empty cells vs grey for
-    recorded "no data", light grid borders and € money formatting. A "Legend" sheet
-    documents the colours.
+    Styling is print-first and ink-light: solid fills are reserved for the few
+    NOTEWORTHY states (red Check, amber empty cell, coloured "yes" indicators);
+    everything structural — header, divider bars, the Incident No. lane — is drawn
+    with coloured text and borders on white, so a printed page spends toner only
+    where it flags something. Binary Sec 19 / Supp. Role columns show as ✓/✗ (a
+    distinct hue per column), recorded "no data" recedes in grey italic text,
+    light grid borders and € money formatting. A "Legend" sheet documents it all.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -858,14 +881,15 @@ def write_xlsx(rows: list[dict], path: Path,
     src_files = sorted({Path(str(r["source_file"])).name
                         for r in rows if r.get("source_file")})
 
-    # ---- palette: each kind of cell gets a colour you can read at a glance -- #
-    C_HEADER, C_HEADER_TXT = "1F3864", "FFFFFF"   # deep-navy header (anchors the top)
+    # ---- palette: ink-light, print-first ------------------------------------ #
+    # Solid fills are reserved for NOTEWORTHY states only (Check, empty, indicator
+    # "yes"); structural colour (header, dividers, key lane) is text + borders on
+    # white, which costs almost no toner but still reads at a glance.
+    C_HEADER = "1F3864"                             # deep-navy header TEXT + rule
     C_HACC = "8EA9DB"                              # default header underline accent
-    C_BAND = "EEF3FA"                              # zebra shading on alt. rows
     C_BLANK = "FFF2CC"                              # amber  -> empty / not extracted
-    C_NA_FILL, C_NA_TXT = "E7E6E6", "7F7F7F"       # grey   -> report recorded no data
+    C_NA_TXT = "7F7F7F"                             # grey   -> report recorded no data
     C_CHK_FILL, C_CHK_TXT = "FFC7CE", "9C0006"     # red    -> Check: differs from banner
-    C_DIV_TXT = "FFFFFF"                            # white text on the divider bars
     C_GRID = "D9D9D9"                              # light cell borders
 
     thin = Side(style="thin", color=C_GRID)
@@ -873,15 +897,16 @@ def write_xlsx(rows: list[dict], path: Path,
     head_border = Border(left=thin, right=thin, top=thin,
                          bottom=Side(style="medium", color=C_HACC))
 
-    band_fill  = PatternFill("solid", fgColor=C_BAND)
     blank_fill = PatternFill("solid", fgColor=C_BLANK)
-    na_fill    = PatternFill("solid", fgColor=C_NA_FILL)
     chk_fill   = PatternFill("solid", fgColor=C_CHK_FILL)
-    head_fill  = PatternFill("solid", fgColor=C_HEADER)
-    C_KEY = "FFE699"                                # gold lane -> Incident No. (key field)
-    key_fill = PatternFill("solid", fgColor=C_KEY)
-    # Each banner level gets a DISTINCT background hue (not just a lighter slate) so the
-    # three levels read as clearly different bands; indent/size reinforce the nesting.
+    # Gold lane -> Incident No. (key field): a bordered lane, not a filled one —
+    # medium gold rules either side of the column plus bold text mark it out.
+    C_KEY = "BF8F00"
+    key_side = Side(style="medium", color=C_KEY)
+    key_border = Border(left=key_side, right=key_side, top=thin, bottom=thin)
+    # Each banner level gets a DISTINCT hue (not just a lighter slate) so the three
+    # levels read as clearly different; the hue is carried by the divider's TEXT and
+    # its top/bottom rules — no solid bar — with indent/size reinforcing the nesting.
     DIV_SHADE = {"grp_why": "33415C",     # L1 indigo
                  "grp_type": "2E5E4E",    # L2 teal-green
                  "grp_station": "5C3F66"} # L3 plum
@@ -890,38 +915,29 @@ def write_xlsx(rows: list[dict], path: Path,
     # all clearly larger/taller than the 11pt data rows so they stand out at a glance.
     DIV_SIZE   = {"grp_why": 15, "grp_type": 13, "grp_station": 12}
     DIV_HEIGHT = {"grp_why": 32, "grp_type": 27, "grp_station": 24}
-    # The value in each banner is highlighted in a bright colour matched to its level,
-    # contrasting against that level's background.
-    BANNER_VAL = {"grp_why": "FFCF5C", "grp_type": "A8F0C8", "grp_station": "F0B6E8"}
 
     base_font = Font(name="Calibri", size=11)
     key_font  = Font(name="Calibri", size=13, bold=True)   # Incident No. — most scanned
     na_font   = Font(name="Calibri", size=11, italic=True, color=C_NA_TXT)
     chk_font  = Font(name="Calibri", size=11, bold=True, color=C_CHK_TXT)
-    head_font = Font(bold=True, color=C_HEADER_TXT, size=12)
-    div_font  = Font(bold=True, color=C_DIV_TXT, size=11)   # Legend swatches
-    div_fonts = {k: Font(name="Calibri", bold=True, color=C_DIV_TXT, size=s)
+    head_font = Font(bold=True, color=C_HEADER, size=12)
+    div_fonts = {k: Font(name="Calibri", bold=True, color=DIV_SHADE[k], size=s)
                  for k, s in DIV_SIZE.items()}
     link_font = Font(name="Calibri", size=11, color="0563C1", underline="single")
 
-    # Binary-state colours — ONLY the noteworthy "yes" state carries colour (a distinct
-    # hue per column so Sec 19 and Supp. Role read differently); the routine "no" recedes
-    # in grey. {key: {True: (glyph, fill, font), False: (...)}}.
+    # Binary-state colours — ONLY the noteworthy "yes" state carries a fill (a distinct
+    # hue per column so Sec 19 and Supp. Role read differently); the routine "no"
+    # recedes as a plain grey glyph, no fill. {key: {True: (glyph, fill, font), ...}}.
     def _swatch(bg, fg):
-        return (PatternFill("solid", fgColor=bg),
+        return (PatternFill("solid", fgColor=bg) if bg else None,
                 Font(name="Calibri", size=11, bold=True, color=fg))
-    _grey = _swatch(C_NA_FILL, C_NA_TXT)
+    _grey = ("✗", *_swatch(None, C_NA_TXT))                 # grey glyph, no fill
     INDICATOR_STYLE = {
         "sec19": {True:  ("✓", *_swatch("C6EFCE", "006100")),   # green = yes (noteworthy)
-                  False: ("✗", *_grey)},                        # grey  = no
+                  False: _grey},
         "supp_role_info": {True:  ("✓", *_swatch("BDD7EE", "1F4E79")),  # blue = yes (noteworthy)
-                           False: ("✗", *_grey)},                       # grey = no
+                           False: _grey},
     }
-    # A heavy white rule on the top+bottom ONLY sets each banner apart from the rows
-    # around it (and from stacked banner levels). No left/right edges, so the colour
-    # runs solid across the whole row instead of being chopped up by cell borders.
-    div_edge = Side(style="medium", color="FFFFFF")
-    div_border = Border(top=div_edge, bottom=div_edge)
 
     # Per-column behaviour. Uniform rules so the sheet reads consistently:
     #   * vertical: EVERY data cell is top-aligned (see put_data_row).
@@ -946,7 +962,7 @@ def write_xlsx(rows: list[dict], path: Path,
         ws.append([h for _, h in cols])
         for ci, (key, _) in enumerate(cols, start=1):
             c = ws.cell(row=1, column=ci)
-            c.font, c.fill = head_font, head_fill
+            c.font = head_font
             accent = HEADER_ACCENT.get(key, C_HACC)
             c.border = Border(left=thin, right=thin, top=thin,
                               bottom=Side(style="thick", color=accent))
@@ -961,7 +977,7 @@ def write_xlsx(rows: list[dict], path: Path,
             return raw.strip().lower() == "yes"
         return bool(raw.strip()) and not _is_no_data(raw)
 
-    def put_data_row(ws, rr: int, r: dict, banded: bool) -> None:
+    def put_data_row(ws, rr: int, r: dict) -> None:
         for ci, (key, _) in enumerate(cols, start=1):
             raw_val = r.get(key, "")
             raw = _norm(str(raw_val))
@@ -981,26 +997,25 @@ def write_xlsx(rows: list[dict], path: Path,
                     cell.comment = cm
                 else:
                     cell.font = base_font
-                    if banded:
-                        cell.fill = band_fill
                 continue
 
-            # Binary columns: a centred ✓ (yes) / ✗ (no), each state in its own colour
-            # (distinct palette per column — see INDICATOR_STYLE), so the zebra band
-            # is irrelevant here.
+            # Binary columns: a centred ✓ (yes) / ✗ (no); only the noteworthy "yes"
+            # carries a fill (distinct hue per column — see INDICATOR_STYLE).
             if key in INDICATOR:
                 glyph, fill, font = INDICATOR_STYLE[key][_indicator_on(key, raw)]
                 cell = ws.cell(row=rr, column=ci, value=glyph)
                 cell.border = cell_border
                 cell.alignment = Alignment(vertical="top", horizontal="center")
-                cell.fill, cell.font = fill, font
+                cell.font = font
+                if fill is not None:
+                    cell.fill = fill
                 continue
 
             value = raw_val
             if key in RIGHT:
                 num = _as_number(raw_val)
                 value = num if num is not None else raw_val
-            cell = ws.cell(row=rr, column=ci, value=value)
+            cell = ws.cell(row=rr, column=ci, value=_formula_safe(value))
             cell.border = cell_border
             cell.font = base_font
 
@@ -1025,19 +1040,19 @@ def write_xlsx(rows: list[dict], path: Path,
                     or "Sec 19 region match anomaly"
                 cm = Comment(detail, "parser"); cm.width, cm.height = 260, 80
                 cell.comment = cm
-            # The key field (Incident No.) gets a persistent gold lane + bold/larger
-            # text so the eye lands on it; an empty one still flags amber.
+            # The key field (Incident No.) gets a gold-ruled lane (borders, not a
+            # fill) + bold/larger text so the eye lands on it; an empty one still
+            # flags amber.
             elif key in EMPHASIS:
-                cell.font = key_font
-                cell.fill = blank_fill if raw == "" else key_fill
+                cell.font, cell.border = key_font, key_border
+                if raw == "":
+                    cell.fill = blank_fill
             # Colour, most specific first: empty cells (amber, possible gap), then
-            # recorded "no data" (grey), then the zebra band.
+            # recorded "no data" (grey italic text, no fill).
             elif raw == "":
                 cell.fill = blank_fill
             elif _is_no_data(raw):
-                cell.fill, cell.font = na_fill, na_font
-            elif banded:
-                cell.fill = band_fill
+                cell.font = na_font
 
             # Link the Page number to that page of the source PDF (#page=N).
             if key == "page" and raw and r.get("source_path"):
@@ -1046,9 +1061,12 @@ def write_xlsx(rows: list[dict], path: Path,
 
     def put_divider(ws, rr: int, level: str, value: str, dept: str,
                     count: int, reported: str) -> None:
-        # A slate bar across the row, shaded and indented by banner level; the label
-        # lives in column A and overflows rightward over the (empty) cells. No merged
-        # cells, so nothing here can interfere with the flat sheet's filter/sort.
+        # A heading rule across the row — bold text and top/bottom rules in the
+        # level's hue on a white background (no solid bar: a filled 30pt row is the
+        # single biggest toner sink on a printed page), indented by banner level;
+        # the label lives in column A and overflows rightward over the (empty)
+        # cells. No merged cells, so nothing here can interfere with the flat
+        # sheet's filter/sort.
         label = next(l for k, l, _h in BANNER_LEVELS if k == level)
         # Trailing bits after the value: dept (station level only) + the incident count.
         tail = []
@@ -1058,15 +1076,20 @@ def write_xlsx(rows: list[dict], path: Path,
         if reported and reported.isdigit() and reported != str(count):
             n += f" (banner: {reported})"
         tail.append(n)
-        fill = PatternFill("solid", fgColor=DIV_SHADE[level])
+        # The outer level gets a heavier top rule, so the biggest breaks also read
+        # as the strongest lines — hue + size + indent + rule weight all agree.
+        edge = Side(style="thick" if level == "grp_why" else "medium",
+                    color=DIV_SHADE[level])
+        div_border = Border(top=edge,
+                            bottom=Side(style="thin", color=DIV_SHADE[level]))
         for ci in range(1, ncols + 1):
             c = ws.cell(row=rr, column=ci)
-            c.fill, c.border = fill, div_border
+            c.border = div_border
             if ci == 1:
                 # Indent signals nesting depth. The whole bar is drawn with one
-                # cell-level font (white, bold, sized per level) rather than per-run
-                # rich text: inline rich text does NOT round-trip reliably through
-                # openpyxl, and LibreOffice (the print path) drops per-run
+                # cell-level font (level hue, bold, sized per level) rather than
+                # per-run rich text: inline rich text does NOT round-trip reliably
+                # through openpyxl, and LibreOffice (the print path) drops per-run
                 # formatting — both leave the bar looking like a plain data row.
                 indent = "   " * DIV_INDENT[level]
                 c.value = (indent + label + " " + (value or "(none)")
@@ -1121,7 +1144,7 @@ def write_xlsx(rows: list[dict], path: Path,
         # Report? > Incident Type > Local Station), each row still self-describing
         # via the filled-down group columns. No auto-filter — the dividers are the
         # organisation here (re-run for a fresh sheet if you need to re-sort).
-        rr, band = 1, 0
+        rr = 1
         prev = ("", "", "")
         for i, r in enumerate(rows):
             cur = _grp_key(r)
@@ -1135,16 +1158,14 @@ def write_xlsx(rows: list[dict], path: Path,
                 dept = _norm(str(r.get("grp_dept", ""))) if key == "grp_station" else ""
                 reported = _norm(str(r.get(key + "_n", "")))
                 put_divider(ws, rr, key, cur[depth], dept, span(i, depth + 1), reported)
-                band = 0                     # restart zebra under each fresh group
             rr += 1
-            put_data_row(ws, rr, r, band % 2 == 1)
-            band += 1
+            put_data_row(ws, rr, r)
             prev = cur
         ws.freeze_panes = "A2"        # header only (divider text overflows from col A)
     else:
         # No banners detected — fall back to a flat, filterable/sortable table.
         for di, r in enumerate(rows):
-            put_data_row(ws, di + 2, r, di % 2 == 1)
+            put_data_row(ws, di + 2, r)
         ws.freeze_panes = "B2"        # keep the Page column visible while scrolling
         ws.auto_filter.ref = ws.dimensions
     set_widths(ws)
@@ -1175,28 +1196,31 @@ def write_xlsx(rows: list[dict], path: Path,
     leg = wb.create_sheet("Legend")
     leg["A1"] = "Colour key"
     leg["A1"].font = Font(bold=True, size=12)
-    shade = {k: PatternFill("solid", fgColor=v) for k, v in DIV_SHADE.items()}
-    bval_font = {k: Font(bold=True, color=v) for k, v in BANNER_VAL.items()}
+    # Each divider level is shown as it prints: hue-coloured bold text between
+    # top/bottom rules in the same hue (matching put_divider), not a solid bar.
+    def _div_border(level):
+        return Border(top=Side(style="thick" if level == "grp_why" else "medium",
+                               color=DIV_SHADE[level]),
+                      bottom=Side(style="thin", color=DIV_SHADE[level]))
     s19 = INDICATOR_STYLE["sec19"]; sup = INDICATOR_STYLE["supp_role_info"]
     legend_rows = [
-        ("✓",    s19[True][1],  s19[True][2],  "Sec 19 = yes (referenced in the narrative)"),
-        ("✗",    s19[False][1], s19[False][2], "Sec 19 = no"),
-        ("✓",    sup[True][1],  sup[True][2],  "Supp. Role = yes (supplementary role information present)"),
-        ("✗",    sup[False][1], sup[False][2], "Supp. Role = no (none recorded)"),
-        ("⚠",    chk_fill,  chk_font,  "Check — a value disagrees with the banner it falls under; open the Page link to inspect the source"),
-        ("",     blank_fill, base_font, "Empty cell — value missing or not extracted"),
-        ("None", na_fill,   na_font,   "Report recorded no data (N/A, None, \"No … recorded/found\")"),
-        ("",     band_fill, base_font, "Alternating row shading — easier line tracking"),
-        ("L1",  shade["grp_why"],     div_fonts["grp_why"],     "Group divider L1 (outer, largest) — Why on Report?"),
-        ("L2",  shade["grp_type"],    div_fonts["grp_type"],    "Group divider L2 — Incident Type"),
-        ("L3",  shade["grp_station"], div_fonts["grp_station"], "Group divider L3 (inner) — Local Station (with dept + count)"),
-        ("Aa",  shade["grp_why"],     bval_font["grp_why"],     "Banner value colour — Why on Report? (level 1)"),
-        ("Aa",  shade["grp_type"],    bval_font["grp_type"],    "Banner value colour — Incident Type (level 2)"),
-        ("Aa",  shade["grp_station"], bval_font["grp_station"], "Banner value colour — Local Station (level 3)"),
+        ("✓",    s19[True][1],  s19[True][2],  cell_border, "Sec 19 = yes (referenced in the narrative)"),
+        ("✗",    s19[False][1], s19[False][2], cell_border, "Sec 19 = no"),
+        ("✓",    sup[True][1],  sup[True][2],  cell_border, "Supp. Role = yes (supplementary role information present)"),
+        ("✗",    sup[False][1], sup[False][2], cell_border, "Supp. Role = no (none recorded)"),
+        ("⚠",    chk_fill,  chk_font,  cell_border, "Check — a value disagrees with the banner it falls under; open the Page link to inspect the source"),
+        ("",     blank_fill, base_font, cell_border, "Empty cell — value missing or not extracted"),
+        ("None", None,      na_font,   cell_border, "Report recorded no data (N/A, None, \"No … recorded/found\")"),
+        ("123",  None,      key_font,  key_border,  "Incident No. — the key field, in its gold-ruled lane"),
+        ("L1",  None, div_fonts["grp_why"],     _div_border("grp_why"),     "Group divider L1 (outer, largest) — Why on Report?"),
+        ("L2",  None, div_fonts["grp_type"],    _div_border("grp_type"),    "Group divider L2 — Incident Type"),
+        ("L3",  None, div_fonts["grp_station"], _div_border("grp_station"), "Group divider L3 (inner) — Local Station (with dept + count)"),
     ]
-    for i, (sample, fill, font, meaning) in enumerate(legend_rows, start=3):
+    for i, (sample, fill, font, border, meaning) in enumerate(legend_rows, start=3):
         sc = leg.cell(row=i, column=1, value=sample)
-        sc.fill, sc.font, sc.border = fill, font, cell_border
+        sc.font, sc.border = font, border
+        if fill is not None:
+            sc.fill = fill
         sc.alignment = Alignment(horizontal="center", vertical="center")
         mc = leg.cell(row=i, column=2, value=meaning)
         mc.alignment = Alignment(vertical="center")
@@ -1209,7 +1233,7 @@ def write_xlsx(rows: list[dict], path: Path,
     if src_files:
         sr = len(legend_rows) + 4
         leg.cell(row=sr, column=1, value="Source file(s):").font = Font(bold=True)
-        leg.cell(row=sr, column=2, value=", ".join(src_files)).alignment = \
+        leg.cell(row=sr, column=2, value=_formula_safe(", ".join(src_files))).alignment = \
             Alignment(vertical="center", wrap_text=True)
 
     # ---- Summary sheet (first): title + at-a-glance breakdown, prints first ---- #
@@ -1220,8 +1244,10 @@ def write_xlsx(rows: list[dict], path: Path,
     supp_yes = sum(1 for r in rows if _indicator_on("supp_role_info",
                                                     _norm(str(r.get("supp_role_info", "")))))
     title_font = Font(bold=True, size=18, color="1F3864")
-    sect_font  = Font(bold=True, size=12, color="FFFFFF")
-    sect_fill  = PatternFill("solid", fgColor=C_HEADER)
+    # Section headings match the ink-light Incidents header: navy text over a navy
+    # rule instead of a solid navy bar.
+    sect_font   = Font(bold=True, size=12, color=C_HEADER)
+    sect_border = Border(bottom=Side(style="medium", color=C_HEADER))
     label_font = Font(bold=True)
     big_num    = Font(bold=True, size=14)
 
@@ -1237,8 +1263,8 @@ def write_xlsx(rows: list[dict], path: Path,
 
     def _section(r, text):
         c = summ.cell(row=r, column=1, value=text)
-        c.font, c.fill = sect_font, sect_fill
-        summ.cell(row=r, column=2).fill = sect_fill
+        c.font, c.border = sect_font, sect_border
+        summ.cell(row=r, column=2).border = sect_border
         return r + 1
 
     def _stat(r, label, value):
@@ -1249,7 +1275,7 @@ def write_xlsx(rows: list[dict], path: Path,
     def _breakdown(r, title, counts):
         r = _section(r, title)
         for name, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            summ.cell(row=r, column=1, value=name or "(none)")
+            summ.cell(row=r, column=1, value=_formula_safe(name or "(none)"))
             summ.cell(row=r, column=2, value=n).alignment = Alignment(horizontal="right")
             r += 1
         return r + 1
@@ -1283,7 +1309,7 @@ def write_xlsx(rows: list[dict], path: Path,
         dh = ["Page", "Incident No.", "Case No.", "Issue"]
         for ci, h in enumerate(dh, start=1):
             c = disc.cell(row=4, column=ci, value=h)
-            c.font, c.fill, c.border = head_font, head_fill, head_border
+            c.font, c.border = head_font, head_border
             c.alignment = Alignment(horizontal="center", vertical="center")
         dr = 5
         for r_ in flagged:
@@ -1293,11 +1319,11 @@ def write_xlsx(rows: list[dict], path: Path,
             if pg and r_.get("source_path"):
                 pc.hyperlink = _page_link(r_["source_path"], path, pg)
                 pc.font = link_font
-            disc.cell(row=dr, column=2, value=r_.get("incident_no", "")).alignment = \
+            disc.cell(row=dr, column=2, value=_formula_safe(r_.get("incident_no", ""))).alignment = \
                 Alignment(horizontal="center")
-            disc.cell(row=dr, column=3, value=r_.get("case_no", "")).alignment = \
+            disc.cell(row=dr, column=3, value=_formula_safe(r_.get("case_no", ""))).alignment = \
                 Alignment(horizontal="center")
-            disc.cell(row=dr, column=4, value=_norm(str(r_.get("check_detail", ""))))
+            disc.cell(row=dr, column=4, value=_formula_safe(_norm(str(r_.get("check_detail", "")))))
             for ci in range(1, 5):
                 disc.cell(row=dr, column=ci).border = cell_border
             dr += 1
@@ -1323,7 +1349,7 @@ def write_xlsx(rows: list[dict], path: Path,
     if skipped:
         for ci, h in enumerate(["Page", "Source File"], start=1):
             c = skp.cell(row=4, column=ci, value=h)
-            c.font, c.fill, c.border = head_font, head_fill, head_border
+            c.font, c.border = head_font, head_border
             c.alignment = Alignment(horizontal="center", vertical="center")
         sdr = 5
         for s in skipped:
@@ -1357,7 +1383,7 @@ def write_csv(rows: list[dict], path: Path,
         w = csv.writer(fh)
         w.writerow([h for _, h in cols])
         for r in rows:
-            w.writerow([r.get(k, "") for k, _ in cols])
+            w.writerow([_formula_safe(r.get(k, "")) for k, _ in cols])
 
 
 def write_json(rows: list[dict], path: Path,
