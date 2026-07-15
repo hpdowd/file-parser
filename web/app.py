@@ -298,9 +298,14 @@ async def parse(request: Request, file: UploadFile,
 
 @app.post("/print")
 async def print_xlsx(request: Request, file: UploadFile, token: str = Form(""),
+                     mono: str = Form(""),
                      user: str = Depends(_verify_access)) -> JSONResponse:
     if not PRINTER_URI:
         raise HTTPException(503, "Printing is not configured on this server.")
+    # Black & white when requested, else let the printer decide (colour for a
+    # colour printer). This maps a browser flag onto a fixed IPP keyword — the
+    # value is never taken verbatim from the request, so no injection into ipptool.
+    color_mode = "monochrome" if mono.strip().lower() in {"1", "true", "on", "yes"} else "auto"
     work = _private_tmpdir()
     try:
         xlsx_path = Path(work) / "incidents.xlsx"
@@ -345,7 +350,8 @@ async def print_xlsx(request: Request, file: UploadFile, token: str = Form(""),
             # non-zero unless the Print-Job's STATUS expectation (successful-ok) holds.
             try:
                 prc, pout, perr = _run(
-                    ["ipptool", "-tv", "-f", str(pdf_path), PRINTER_URI, str(IPP_TEMPLATE)],
+                    ["ipptool", "-tv", "-d", f"color_mode={color_mode}",
+                     "-f", str(pdf_path), PRINTER_URI, str(IPP_TEMPLATE)],
                     timeout=PRINT_TIMEOUT)
             except subprocess.TimeoutExpired:
                 log.error("ipptool timed out after %ss", PRINT_TIMEOUT)
@@ -354,7 +360,7 @@ async def print_xlsx(request: Request, file: UploadFile, token: str = Form(""),
                 log.error("ipptool failed: %s", (perr or pout).strip())
                 raise HTTPException(502, "The printer rejected the job.")
 
-        log.info("print user=%s printer=%s ok", user, PRINTER_URI)
+        log.info("print user=%s printer=%s color=%s ok", user, PRINTER_URI, color_mode)
         return JSONResponse({"status": "queued", "detail": "Sent to the printer."})
     finally:
         shutil.rmtree(work, ignore_errors=True)

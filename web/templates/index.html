@@ -28,6 +28,9 @@
                  color:var(--txt); }
   .row { display:flex; gap:10px; margin-top:18px; }
   .row button { flex:1; }
+  .opt { display:flex; align-items:center; gap:8px; margin-top:12px;
+         font-size:13px; color:var(--muted); cursor:pointer; }
+  .opt input { accent-color:var(--accent); cursor:pointer; }
   #status { margin-top:16px; font-size:13px; min-height:20px; }
   .ok { color:var(--ok); } .warn { color:var(--warn); }
   .foot { margin-top:22px; font-size:12px; color:var(--muted);
@@ -60,6 +63,7 @@
       <button id="dlBtn" class="ghost">⬇ Download .xlsx</button>
       <button id="printBtn">🖨 Print in office</button>
     </div>
+    <label class="opt"><input type="checkbox" id="mono"> Print in black &amp; white</label>
   </div>
 
   <div id="status"></div>
@@ -137,6 +141,7 @@ $("printBtn").addEventListener("click", async () => {
     fd.append("file", new File([resultBlob], resultName,
       { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
     fd.append("token", resultToken);
+    if ($("mono").checked) fd.append("mono", "1");
     const res = await fetch("/print", { method:"POST", body: fd });
     setStatus(res.ok ? "Sent to the printer." : await msgFrom(res),
               res.ok ? "ok" : "warn");

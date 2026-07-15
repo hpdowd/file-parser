@@ -1,5 +1,7 @@
 # ipptool job template: submit one PDF to an IPP Everywhere printer.
 # $uri is the printer URI given on the command line; $filename is the -f argument.
+# $color_mode is supplied by the caller with `-d color_mode=…` (auto | monochrome);
+# app.py always sets it (see /print).
 {
 	NAME "Print Incident Report"
 	OPERATION Print-Job
@@ -12,8 +14,13 @@
 	ATTR mimeMediaType document-format application/pdf
 	GROUP job-attributes-tag
 	ATTR integer copies 1
+	ATTR keyword print-color-mode $color_mode
 	FILE $filename
+	# Any success status passes: a printer that doesn't support print-color-mode
+	# may echo it back as ignored/substituted rather than plain successful-ok.
 	STATUS successful-ok
+	STATUS successful-ok-ignored-or-substituted-attributes
+	STATUS successful-ok-conflicting-attributes
 	DISPLAY job-id
 	DISPLAY job-state
 }
