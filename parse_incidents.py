@@ -1767,6 +1767,97 @@ def diagnose_files(paths: list[Path]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+#  Engine comparison (verify a faster engine extracts like the reference)      #
+# --------------------------------------------------------------------------- #
+def compare_engines(paths: list[Path],
+                    ref: str = "pdfplumber", new: str = "pdfium") -> int:
+    """Parse the same file(s) with two engines and report every field where they
+    disagree, page by page. `ref` is the trusted reference (pdfplumber, which the
+    parser was built and validated against); `new` is the engine being verified
+    (pdfium). If the two agree on every field, the new engine is extracting exactly
+    like the reference and is verified on this data.
+
+    Prints REAL extracted values (like --debug) so it can be eyeballed against the
+    document — therefore it is LOCAL-ONLY: do not share this output. Compares the
+    output columns (Source File, Page, Check, the group banners, and every FIELD),
+    aligning rows by (source file, page)."""
+    for engine in (ref, new):
+        if engine not in _PAGE_ITERATORS:
+            print(f"error: unknown engine {engine!r}", file=sys.stderr)
+            return 2
+    try:
+        import pypdfium2  # noqa: F401
+    except Exception:
+        if "pdfium" in (ref, new):
+            print("error: pypdfium2 not installed — needed to compare the pdfium "
+                  "engine", file=sys.stderr)
+            return 2
+
+    print(f"Comparing extraction: reference={ref}  vs  new={new}")
+    rows_ref, sk_ref = parse_files(paths, engine=ref)
+    rows_new, sk_new = parse_files(paths, engine=new)
+
+    def key(r: dict) -> tuple:
+        return (r.get("source_file"), r.get("page"))
+
+    map_ref = {key(r): r for r in rows_ref}
+    map_new = {key(r): r for r in rows_new}
+    keys = sorted(set(map_ref) | set(map_new),
+                  key=lambda k: (str(k[0]), k[1] if isinstance(k[1], int) else -1))
+
+    cols = _columns()  # (field_key, header) for every output column
+    only_ref = [k for k in keys if k not in map_new]
+    only_new = [k for k in keys if k not in map_ref]
+    common = [k for k in keys if k in map_ref and k in map_new]
+
+    print(f"\nrows: {ref}={len(rows_ref)}  {new}={len(rows_new)}    "
+          f"skipped pages: {ref}={len(sk_ref)}  {new}={len(sk_new)}")
+    if [s.get("page") for s in sk_ref] != [s.get("page") for s in sk_new]:
+        print(f"  ! skipped-page sets differ: {ref}={[s.get('page') for s in sk_ref]} "
+              f"{new}={[s.get('page') for s in sk_new]}")
+    for k in only_ref:
+        print(f"  ! page extracted by {ref} but NOT {new}: {k[0]} p{k[1]}")
+    for k in only_new:
+        print(f"  ! page extracted by {new} but NOT {ref}: {k[0]} p{k[1]}")
+
+    field_diff_counts: dict[str, int] = {}
+    diff_pages = 0
+    for k in common:
+        a, b = map_ref[k], map_new[k]
+        page_diffs = []
+        for fkey, header in cols:
+            va, vb = a.get(fkey, ""), b.get(fkey, "")
+            if str(va) != str(vb):
+                page_diffs.append((header, fkey, va, vb))
+                field_diff_counts[header] = field_diff_counts.get(header, 0) + 1
+        if page_diffs:
+            diff_pages += 1
+            print(f"\n{k[0]} p{k[1]}:")
+            for header, fkey, va, vb in page_diffs:
+                ws = " (whitespace only)" if str(va).split() == str(vb).split() else ""
+                print(f"  {header} ({fkey}){ws}")
+                print(f"    {ref:11s}: {va!r}")
+                print(f"    {new:11s}: {vb!r}")
+
+    n_fields = len(cols)
+    print(f"\n{'='*60}\nSUMMARY")
+    print(f"  compared {len(common)} common page(s) × {n_fields} field(s)")
+    if not field_diff_counts and not only_ref and not only_new \
+            and len(rows_ref) == len(rows_new):
+        print(f"  ✓ NO differences — {new} extracts identically to {ref} on this "
+              f"data. Verified.")
+        return 0
+    if field_diff_counts:
+        print(f"  {sum(field_diff_counts.values())} differing field-instance(s) "
+              f"across {diff_pages} page(s). By field:")
+        for header, n in sorted(field_diff_counts.items(), key=lambda x: -x[1]):
+            print(f"    {n:4d}  {header}")
+    print("\n(Review the diffs above against the document. Whitespace-only diffs are "
+          "usually harmless. This output contains real data — keep it local.)")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
 #  CLI                                                                         #
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1792,6 +1883,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--diagnose", action="store_true",
                     help="check whether a PDF's text is actually extractable "
                          "(scan/OCR/encoding health) — safe to share, no content")
+    ap.add_argument("--compare-engines", action="store_true",
+                    help="parse with BOTH engines (pdfplumber reference vs pdfium) "
+                         "and report every field they disagree on, page by page — "
+                         "to verify the faster engine extracts identically on real "
+                         "data. Prints real values, so keep the output local.")
     ap.add_argument("--region-map", metavar="FILE",
                     help="Local Station -> region code/name map for Sec 19 "
                          "incidents — plaintext or an --encrypt-region-map output "
@@ -1840,6 +1936,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.diagnose:
         return diagnose_files(paths)
+
+    if args.compare_engines:
+        return compare_engines(paths)
 
     region_map = None
     if args.region_map:
