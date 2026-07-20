@@ -98,6 +98,9 @@ uv run parse_incidents.py INPUT [INPUT ...] [options]
                         extraction logic. Also settable via the PARSER_ENGINE
                         environment variable.
   --inspect             privacy-safe structural report (every value masked)
+  --compare-engines     parse with both back-ends and report any field they
+                        disagree on, page by page (verify one engine against
+                        the other on real data; prints real values, keep local)
   --diagnose            check whether the PDF's text is actually extractable
   --self-test           parse the bundled template.pdf and check every *** cell
   --region-map FILE     station -> region code/name map, applied to Sec 19
