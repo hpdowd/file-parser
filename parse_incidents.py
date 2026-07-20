@@ -662,17 +662,19 @@ def iter_pdf_paths(inputs: list[str]) -> list[Path]:
 # --------------------------------------------------------------------------- #
 # Two interchangeable back-ends produce the SAME PageView (words/lines/rects), so
 # every locator/matcher downstream is identical regardless of engine:
-#   * "pdfplumber" — the pure-Python reference. Correct but slow: pdfminer's
-#     content-stream tokenizer dominates runtime (~90%+).
-#   * "pdfium"     — pypdfium2 (the PDFium C library). Several times faster at
-#     ~the same peak memory; word geometry is reconstructed to match pdfplumber's
-#     so extraction is identical. Validate on real exports before making it the
-#     default (masked/synthetic PDFs can't confirm semantic correctness).
+#   * "pdfium"     — pypdfium2 (the PDFium C library). The default: several times
+#     faster than pdfplumber at ~the same peak memory. Word geometry is
+#     reconstructed to match pdfplumber's so extraction is identical; validated on
+#     a real export (2026-07-20) — same rows, ran live before becoming the default.
+#   * "pdfplumber" — the pure-Python reference/fallback. Correct but slow:
+#     pdfminer's content-stream tokenizer dominates runtime (~90%+). Kept as a
+#     fallback (--engine pdfplumber / PARSER_ENGINE=pdfplumber) and still used by
+#     --inspect/--diagnose.
 # Both iterators STREAM: they build one page's PageView, yield it, then close the
 # underlying page immediately, so peak memory stays ~one page regardless of length.
 ENGINES = ("pdfplumber", "pdfium")
-DEFAULT_ENGINE = os.environ.get("PARSER_ENGINE", "pdfplumber").strip().lower() \
-    or "pdfplumber"
+DEFAULT_ENGINE = os.environ.get("PARSER_ENGINE", "pdfium").strip().lower() \
+    or "pdfium"
 
 
 def _iter_pdfplumber(pdf_path: Path):
@@ -924,7 +926,7 @@ def parse_files(paths: list[Path], debug: bool = False,
     Investigating Member (which a Sec 19 incident normally leaves blank).
 
     `engine` selects the PDF extraction back-end ("pdfplumber" | "pdfium"); None
-    uses DEFAULT_ENGINE ($PARSER_ENGINE, else "pdfplumber"). See the engine
+    uses DEFAULT_ENGINE ($PARSER_ENGINE, else "pdfium"). See the engine
     iterators above — both stream page-by-page with flat peak memory."""
     engine = (engine or DEFAULT_ENGINE)
     if engine not in _PAGE_ITERATORS:
@@ -1779,10 +1781,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--debug", action="store_true",
                     help="print every extracted field for each page")
     ap.add_argument("--engine", choices=list(ENGINES), default=DEFAULT_ENGINE,
-                    help="PDF extraction back-end: 'pdfplumber' (default, pure-Python "
-                         "reference) or 'pdfium' (pypdfium2 — several times faster at "
-                         "~the same memory; validate on real data first). Overrides "
-                         "$PARSER_ENGINE.")
+                    help="PDF extraction back-end: 'pdfium' (default, pypdfium2 — "
+                         "several times faster at ~the same memory) or 'pdfplumber' "
+                         "(pure-Python fallback/reference). Overrides $PARSER_ENGINE.")
     ap.add_argument("--self-test", action="store_true",
                     help="run the parser against the bundled template.pdf and exit")
     ap.add_argument("--inspect", action="store_true",
