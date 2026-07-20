@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pdfplumber>=0.11", "openpyxl>=3.1", "cryptography>=42"]
+# dependencies = ["pdfplumber>=0.11", "openpyxl>=3.1", "cryptography>=42", "pypdfium2>=4"]
 # ///
 """
 parse_incidents.py
@@ -102,16 +102,39 @@ class PageView:
     LINE_TOL = 3.0  # words within this vertical distance are on the same line
 
     def __init__(self, page) -> None:
-        self.width = float(page.width)
-        self.height = float(page.height)
-        self.words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+        # pdfplumber-backed construction: used by --inspect/--diagnose and the
+        # pdfplumber extraction engine. The faster pdfium engine builds an
+        # equivalent PageView via from_parts() from pypdfium2-extracted
+        # words/rects, so all matching below is identical either way.
+        self._init_parts(
+            float(page.width), float(page.height),
+            page.extract_words(use_text_flow=False, keep_blank_chars=False),
+            list(page.rects))
+
+    @classmethod
+    def from_parts(cls, width: float, height: float,
+                   words: list[dict], rects: list[dict]) -> "PageView":
+        """Build a PageView from already-extracted word/rect dicts (same schema as
+        pdfplumber's) rather than a live pdfplumber page. Lets an alternate, faster
+        extraction engine feed the identical matching logic — see
+        _pdfium_page_view, which reconstructs pdfplumber-shaped words/rects from
+        PDFium."""
+        self = cls.__new__(cls)
+        self._init_parts(float(width), float(height), words, rects)
+        return self
+
+    def _init_parts(self, width: float, height: float,
+                    words: list[dict], rects: list[dict]) -> None:
+        self.width = width
+        self.height = height
+        self.words = words
         for w in self.words:
             w["cx"] = (w["x0"] + w["x1"]) / 2.0
             w["cy"] = (w["top"] + w["bottom"]) / 2.0
         self.lines = self._group_lines()
         # Filled rectangles — used to detect the red cell highlights the report
         # paints on cells that need review (see `_is_red` / loc_supp_role_info).
-        self.rects = list(page.rects)
+        self.rects = rects
 
     def _group_lines(self) -> list[dict]:
         ws = sorted(self.words, key=lambda w: (w["top"], w["x0"]))
@@ -634,23 +657,158 @@ def iter_pdf_paths(inputs: list[str]) -> list[Path]:
     return paths
 
 
-def _extract_pdf(pdf, pdf_path: Path, src_path: str, force: bool,
-                 region_map: Optional[dict[str, tuple[str, str]]],
-                 debug: bool) -> tuple[list[dict], list[dict], bool]:
-    """Stream one already-open PDF a page at a time, returning (rows, skipped,
-    any_matched).
+# --------------------------------------------------------------------------- #
+#  Extraction engines — stream (page_no, PageView) one page at a time          #
+# --------------------------------------------------------------------------- #
+# Two interchangeable back-ends produce the SAME PageView (words/lines/rects), so
+# every locator/matcher downstream is identical regardless of engine:
+#   * "pdfplumber" — the pure-Python reference. Correct but slow: pdfminer's
+#     content-stream tokenizer dominates runtime (~90%+).
+#   * "pdfium"     — pypdfium2 (the PDFium C library). Several times faster at
+#     ~the same peak memory; word geometry is reconstructed to match pdfplumber's
+#     so extraction is identical. Validate on real exports before making it the
+#     default (masked/synthetic PDFs can't confirm semantic correctness).
+# Both iterators STREAM: they build one page's PageView, yield it, then close the
+# underlying page immediately, so peak memory stays ~one page regardless of length.
+ENGINES = ("pdfplumber", "pdfium")
+DEFAULT_ENGINE = os.environ.get("PARSER_ENGINE", "pdfplumber").strip().lower() \
+    or "pdfplumber"
 
-    Memory: never holds more than the current page's PageView, and releases each
-    page's pdfplumber cache (`page.close()`) as soon as we're done with it — so peak
-    memory is ~one page's worth regardless of report length. (The previous version
-    built every page's words/lines/rects up front, which cost ~one page × page-count
-    at once and OOM'd on 200+ page exports.)
+
+def _iter_pdfplumber(pdf_path: Path):
+    """Yield (page_no, PageView) per page, closing each page's pdfplumber cache as
+    soon as it's consumed. A page whose PageView can't be built is skipped (with a
+    warning) but still counts toward the physical page number."""
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                try:
+                    pv = PageView(page)
+                except Exception as exc:
+                    print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
+                          file=sys.stderr)
+                    continue
+                yield i, pv
+            finally:
+                page.close()
+
+
+def _pdfium_page_view(page) -> PageView:
+    """Build a PageView from a pypdfium2 page (the "pdfium" engine).
+
+    Words are reconstructed from PDFium's per-character boxes and grouped with
+    pdfplumber's own extract_words, so segmentation and reading order are identical
+    to the pdfplumber engine. The *loose* char box (font metric box, not the tight
+    glyph-ink box) is used because that matches pdfplumber's top/bottom convention —
+    without it, coordinates shift and word splitting/ordering diverge.
+
+    Filled rectangles (for the red review-cell highlight — see loc_supp_role_info /
+    _is_red) come from PDFium filled path objects. Only true FILLS are kept: a
+    stroked-only border reports a fill-colour attribute but isn't painted, so its
+    draw mode is checked first (mirrors pdfplumber's `fill` flag)."""
+    import ctypes
+    import pypdfium2.raw as pr
+    from pdfplumber.utils.text import extract_words as _pp_extract_words
+
+    h = float(page.get_height())
+    w = float(page.get_width())
+
+    tp = page.get_textpage()
+    try:
+        chars: list[dict] = []
+        for i in range(tp.count_chars()):
+            text = tp.get_text_range(i, 1)
+            if text == "":
+                continue
+            # loose=True -> font metric box, PDF points, bottom-left origin;
+            # convert to pdfplumber's top-down origin (top/bottom from page top).
+            x0, y_bot, x1, y_top = tp.get_charbox(i, loose=True)
+            top, bottom = h - y_top, h - y_bot
+            size = y_top - y_bot
+            chars.append({
+                "text": text, "x0": x0, "x1": x1, "top": top, "bottom": bottom,
+                "upright": True, "size": size, "height": size, "width": x1 - x0,
+                "adv": x1 - x0, "fontname": "pdfium", "doctop": top,
+                "matrix": (1, 0, 0, 1, 0, 0),
+            })
+        words = _pp_extract_words(chars)
+    finally:
+        tp.close()
+
+    rects: list[dict] = []
+    for obj in page.get_objects():
+        if obj.type != pr.FPDF_PAGEOBJ_PATH:
+            continue
+        fillmode = ctypes.c_int()
+        stroke = ctypes.c_int()
+        if not pr.FPDFPath_GetDrawMode(obj.raw, ctypes.byref(fillmode),
+                                       ctypes.byref(stroke)):
+            continue
+        if fillmode.value == 0:   # stroke-only (e.g. a table border) — not a fill
+            continue
+        r = ctypes.c_uint(); g = ctypes.c_uint()
+        b = ctypes.c_uint(); a = ctypes.c_uint()
+        if not pr.FPDFPageObj_GetFillColor(obj.raw, ctypes.byref(r), ctypes.byref(g),
+                                           ctypes.byref(b), ctypes.byref(a)):
+            continue
+        if a.value == 0:
+            continue
+        lx = ctypes.c_float(); by = ctypes.c_float()
+        rx = ctypes.c_float(); ty = ctypes.c_float()
+        pr.FPDFPageObj_GetBounds(obj.raw, ctypes.byref(lx), ctypes.byref(by),
+                                 ctypes.byref(rx), ctypes.byref(ty))
+        rects.append({
+            "x0": lx.value, "x1": rx.value,
+            "top": h - ty.value, "bottom": h - by.value,
+            "fill": True,
+            "non_stroking_color": (r.value / 255.0, g.value / 255.0, b.value / 255.0),
+        })
+    return PageView.from_parts(w, h, words, rects)
+
+
+def _iter_pdfium(pdf_path: Path):
+    """Yield (page_no, PageView) per page via pypdfium2 (PDFium), same contract as
+    _iter_pdfplumber. Each page is closed right after it's consumed."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                try:
+                    pv = _pdfium_page_view(page)
+                except Exception as exc:
+                    print(f"warning: failed on {pdf_path.name} page {i + 1}: {exc}",
+                          file=sys.stderr)
+                    continue
+                yield i + 1, pv
+            finally:
+                page.close()
+    finally:
+        doc.close()
+
+
+_PAGE_ITERATORS = {"pdfplumber": _iter_pdfplumber, "pdfium": _iter_pdfium}
+
+
+def _extract_pdf(pages, pdf_path: Path, src_path: str, force: bool,
+                 region_map: Optional[dict[str, tuple[str, str]]],
+                 debug: bool) -> tuple[list[dict], list[dict], bool, int]:
+    """Consume a stream of (page_no, PageView) — see the engine iterators above —
+    returning (rows, skipped, any_matched, pages_seen).
+
+    Memory: the iterator holds only the current page's PageView and closes each
+    underlying page as soon as it's consumed, so peak memory is ~one page's worth
+    regardless of report length. (An earlier version built every page's
+    words/lines/rects up front, costing ~one page × page-count at once and OOM'ing
+    on 200+ page exports.)
 
     `force` extracts every page rather than skipping continuation/non-incident ones;
     it's the safety net for a file whose layout matched nothing (see parse_files)."""
     file_rows: list[dict] = []
     file_skipped: list[dict] = []
     any_matched = False
+    pages_seen = 0
     # Last-seen value (and stated count) of each nested banner level, reset per file
     # so one report can't inherit another's groups. Each level is updated whenever
     # its bar reappears; the dept comes from the innermost (station) bar. Updated on
@@ -659,110 +817,101 @@ def _extract_pdf(pdf, pdf_path: Path, src_path: str, force: bool,
     current = {k: "" for k, _l, _h in BANNER_LEVELS}
     counts = {k: "" for k, _l, _h in BANNER_LEVELS}
     dept = ""
-    for i, page in enumerate(pdf.pages, start=1):
+    for i, pv in pages:
+        pages_seen += 1
+        flag = is_incident_page(pv)
+        any_matched = any_matched or flag
+        banners = extract_banners(pv)
+        for key, _l, _h in BANNER_LEVELS:
+            if key in banners:
+                current[key] = banners[key]["value"]
+                counts[key] = banners[key]["count"]
+                if key == "grp_station":
+                    dept = banners[key]["dept"]
+        if banners and debug:
+            print(f"  {pdf_path.name} p{i}: banners -> " + ", ".join(
+                f"{k}={banners[k]['value']!r}" for k in banners))
+        if not flag and not force:
+            file_skipped.append({"source_file": pdf_path.name, "page": i,
+                                 "source_path": src_path})
+            if debug:
+                print(f"  {pdf_path.name} p{i}: continuation/non-incident "
+                      "page — skipped")
+            continue
         try:
-            try:
-                pv = PageView(page)
-            except Exception as exc:
-                print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
-                      file=sys.stderr)
-                continue
-            flag = is_incident_page(pv)
-            any_matched = any_matched or flag
-            banners = extract_banners(pv)
+            row = extract_page(pv, pdf_path.name, i, debug)
             for key, _l, _h in BANNER_LEVELS:
-                if key in banners:
-                    current[key] = banners[key]["value"]
-                    counts[key] = banners[key]["count"]
-                    if key == "grp_station":
-                        dept = banners[key]["dept"]
-            if banners and debug:
-                print(f"  {pdf_path.name} p{i}: banners -> " + ", ".join(
-                    f"{k}={banners[k]['value']!r}" for k in banners))
-            if not flag and not force:
-                file_skipped.append({"source_file": pdf_path.name, "page": i,
-                                     "source_path": src_path})
-                if debug:
-                    print(f"  {pdf_path.name} p{i}: continuation/non-incident "
-                          "page — skipped")
-                continue
-            try:
-                row = extract_page(pv, pdf_path.name, i, debug)
-                for key, _l, _h in BANNER_LEVELS:
-                    row[key] = current[key]
-                    row[key + "_n"] = counts[key]  # banner-stated count
-                row["grp_dept"] = dept
-                row["source_path"] = src_path
-                # Cross-check the per-incident values against the banner this
-                # row falls under: Incident Type vs grp_type, and the Review
-                # Station's local-station prefix vs grp_station. Any mismatch
-                # raises the "check" flag; the reason(s) are recorded in
-                # check_detail (used by the Discrepancies sheet + a cell note).
-                # Done while the full review-station cell is available; then
-                # reduce that column to its bracketed Review Station value.
-                local, review = _split_review_station(row.get("review_station", ""))
-                issues = []
-                if (current["grp_type"] and row.get("incident_type")
-                        and not _same(row["incident_type"], current["grp_type"])):
-                    issues.append("Incident Type differs from banner")
-                if (current["grp_station"] and local
-                        and not _same(local, current["grp_station"])):
-                    issues.append("Local Station differs from banner")
-                row["check"] = "yes" if issues else ""
-                row["check_detail"] = "; ".join(issues)
-                row["review_station"] = review or row.get("review_station", "")
+                row[key] = current[key]
+                row[key + "_n"] = counts[key]  # banner-stated count
+            row["grp_dept"] = dept
+            row["source_path"] = src_path
+            # Cross-check the per-incident values against the banner this
+            # row falls under: Incident Type vs grp_type, and the Review
+            # Station's local-station prefix vs grp_station. Any mismatch
+            # raises the "check" flag; the reason(s) are recorded in
+            # check_detail (used by the Discrepancies sheet + a cell note).
+            # Done while the full review-station cell is available; then
+            # reduce that column to its bracketed Review Station value.
+            local, review = _split_review_station(row.get("review_station", ""))
+            issues = []
+            if (current["grp_type"] and row.get("incident_type")
+                    and not _same(row["incident_type"], current["grp_type"])):
+                issues.append("Incident Type differs from banner")
+            if (current["grp_station"] and local
+                    and not _same(local, current["grp_station"])):
+                issues.append("Local Station differs from banner")
+            row["check"] = "yes" if issues else ""
+            row["check_detail"] = "; ".join(issues)
+            row["review_station"] = review or row.get("review_station", "")
 
-                # Region matching (Sec 19 only, see load_region_map): the
-                # Local Station banner's region code is appended to the
-                # banner value; the mapped name fills Investigating Member,
-                # which a Sec 19 incident is expected to leave blank. If it
-                # wasn't blank, append instead of overwrite and flag the cell
-                # (see write_xlsx) rather than silently discard what was read.
-                # A Sec 19 station with NO match is flagged too — that's
-                # either an unmapped station or a spelling gap in the map,
-                # and either way the row got no auto-fill, so it needs a
-                # human to look rather than pass silently.
-                if region_map and row.get("sec19") == "Yes":
-                    station = current["grp_station"]
-                    match = region_map.get(_norm(station).casefold())
-                    if match:
-                        code, member_name = match
-                        row["grp_station"] = f"{station} {code}"
-                        row["grp_station_n"] = ""  # split off the banner's count
-                        existing = _norm(row.get("investigating_member", ""))
-                        if not existing or _is_no_data(existing):
-                            row["investigating_member"] = member_name
-                        else:
-                            row["investigating_member"] = f"{existing} / {member_name}"
-                            row["investigating_flag"] = "yes"
-                            row["investigating_flag_detail"] = (
-                                "Investigating Member was already populated "
-                                "on this Sec 19 incident — the region name "
-                                "was appended rather than overwriting it")
-                    elif station:
-                        print(f"warning: {pdf_path.name} p{i}: Sec 19 "
-                              f"incident's Local Station {station!r} not "
-                              "found in region map — leaving unchanged",
-                              file=sys.stderr)
+            # Region matching (Sec 19 only, see load_region_map): the
+            # Local Station banner's region code is appended to the
+            # banner value; the mapped name fills Investigating Member,
+            # which a Sec 19 incident is expected to leave blank. If it
+            # wasn't blank, append instead of overwrite and flag the cell
+            # (see write_xlsx) rather than silently discard what was read.
+            # A Sec 19 station with NO match is flagged too — that's
+            # either an unmapped station or a spelling gap in the map,
+            # and either way the row got no auto-fill, so it needs a
+            # human to look rather than pass silently.
+            if region_map and row.get("sec19") == "Yes":
+                station = current["grp_station"]
+                match = region_map.get(_norm(station).casefold())
+                if match:
+                    code, member_name = match
+                    row["grp_station"] = f"{station} {code}"
+                    row["grp_station_n"] = ""  # split off the banner's count
+                    existing = _norm(row.get("investigating_member", ""))
+                    if not existing or _is_no_data(existing):
+                        row["investigating_member"] = member_name
+                    else:
+                        row["investigating_member"] = f"{existing} / {member_name}"
                         row["investigating_flag"] = "yes"
                         row["investigating_flag_detail"] = (
-                            f"Sec 19 incident's Local Station {station!r} "
-                            "wasn't matched to a region — no auto-fill "
-                            "applied, please check")
+                            "Investigating Member was already populated "
+                            "on this Sec 19 incident — the region name "
+                            "was appended rather than overwriting it")
+                elif station:
+                    print(f"warning: {pdf_path.name} p{i}: Sec 19 "
+                          f"incident's Local Station {station!r} not "
+                          "found in region map — leaving unchanged",
+                          file=sys.stderr)
+                    row["investigating_flag"] = "yes"
+                    row["investigating_flag_detail"] = (
+                        f"Sec 19 incident's Local Station {station!r} "
+                        "wasn't matched to a region — no auto-fill "
+                        "applied, please check")
 
-                file_rows.append(row)
-            except Exception as exc:
-                print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
-                      file=sys.stderr)
-        finally:
-            # Release this page's parsed objects/words now that we're done, so
-            # peak memory stays flat across a long report instead of growing.
-            page.close()
-    return file_rows, file_skipped, any_matched
+            file_rows.append(row)
+        except Exception as exc:
+            print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
+                  file=sys.stderr)
+    return file_rows, file_skipped, any_matched, pages_seen
 
 
 def parse_files(paths: list[Path], debug: bool = False,
-                region_map: Optional[dict[str, tuple[str, str]]] = None
+                region_map: Optional[dict[str, tuple[str, str]]] = None,
+                engine: Optional[str] = None
                 ) -> tuple[list[dict], list[dict]]:
     """Returns (rows, skipped). `skipped` lists the continuation/non-incident pages
     that were NOT extracted — {source_file, page, source_path} — so a reviewer can
@@ -772,29 +921,36 @@ def parse_files(paths: list[Path], debug: bool = False,
     `region_map` (see load_region_map) is optional and applies ONLY to Sec 19
     incidents: when the row's Local Station banner matches a mapped station, its
     region code is appended to the banner and the mapped name is filled into
-    Investigating Member (which a Sec 19 incident normally leaves blank)."""
+    Investigating Member (which a Sec 19 incident normally leaves blank).
+
+    `engine` selects the PDF extraction back-end ("pdfplumber" | "pdfium"); None
+    uses DEFAULT_ENGINE ($PARSER_ENGINE, else "pdfplumber"). See the engine
+    iterators above — both stream page-by-page with flat peak memory."""
+    engine = (engine or DEFAULT_ENGINE)
+    if engine not in _PAGE_ITERATORS:
+        print(f"warning: unknown engine {engine!r} — using 'pdfplumber'",
+              file=sys.stderr)
+        engine = "pdfplumber"
+    page_iter = _PAGE_ITERATORS[engine]
     rows: list[dict] = []
     skipped: list[dict] = []
     for pdf_path in paths:
         src_path = str(pdf_path.resolve())  # for the xlsx page hyperlinks
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                n_pages = len(pdf.pages)
-                file_rows, file_skipped, any_matched = _extract_pdf(
-                    pdf, pdf_path, src_path, force=False,
-                    region_map=region_map, debug=debug)
+            file_rows, file_skipped, any_matched, pages_seen = _extract_pdf(
+                page_iter(pdf_path), pdf_path, src_path, force=False,
+                region_map=region_map, debug=debug)
             # Safety net: never silently drop a whole file. If nothing matched the
             # expected layout, re-stream the file extracting every page rather than
             # emit nothing. This is rare (a genuinely unfamiliar layout), so paying a
             # second pass only here keeps the common path single-pass and flat-memory.
-            if n_pages and not any_matched:
+            if pages_seen and not any_matched:
                 print(f"warning: {pdf_path.name}: no page matched the expected "
-                      f"incident layout — extracting all {n_pages} page(s) "
+                      f"incident layout — extracting all {pages_seen} page(s) "
                       f"anyway. Please share a sample so the parser can be tuned.")
-                with pdfplumber.open(pdf_path) as pdf:
-                    file_rows, file_skipped, _ = _extract_pdf(
-                        pdf, pdf_path, src_path, force=True,
-                        region_map=region_map, debug=debug)
+                file_rows, file_skipped, _, _ = _extract_pdf(
+                    page_iter(pdf_path), pdf_path, src_path, force=True,
+                    region_map=region_map, debug=debug)
             rows.extend(file_rows)
             skipped.extend(file_skipped)
         except Exception as exc:
@@ -1439,15 +1595,14 @@ DEFAULT_OUT = {"xlsx": "incidents.xlsx", "csv": "incidents.csv", "json": "incide
 # --------------------------------------------------------------------------- #
 #  Self-test against the bundled template                                      #
 # --------------------------------------------------------------------------- #
-def self_test() -> int:
-    template = Path(__file__).with_name("template.pdf")
-    if not template.exists():
-        print(f"self-test: {template} not found", file=sys.stderr)
-        return 2
-    rows, _ = parse_files([template])
+def _self_test_engine(template: Path, engine: str) -> bool:
+    """Run the template through one engine and check the known field values. Returns
+    True on pass. Both engines must agree — they feed identical matching logic, so a
+    divergence means the engine's word/rect reconstruction is off."""
+    rows, _ = parse_files([template], engine=engine)
     if not rows:
-        print("self-test: no rows extracted", file=sys.stderr)
-        return 1
+        print(f"  [{engine}] no rows extracted", file=sys.stderr)
+        return False
     row = rows[0]
     # In the template every *** target cell literally contains the marker.
     expect_marker = {"incident_no", "incident_type", "investigating_member",
@@ -1460,7 +1615,7 @@ def self_test() -> int:
     expect_value = {"case_no": "None", "sec19": "No", "reference_no": "N/A",
                     "review_station": "place"}
     ok = True
-    print("self-test (template values):")
+    print(f"self-test (template values) — engine: {engine}")
     for f in FIELDS:
         val = row[f.key]
         if f.key in expect_marker:
@@ -1471,6 +1626,23 @@ def self_test() -> int:
             good = "***" in val
         ok = ok and good
         print(f"  [{'PASS' if good else 'FAIL'}] {f.key:22s} = {val!r}")
+    return ok
+
+
+def self_test() -> int:
+    template = Path(__file__).with_name("template.pdf")
+    if not template.exists():
+        print(f"self-test: {template} not found", file=sys.stderr)
+        return 2
+    ok = True
+    for engine in ENGINES:
+        if engine == "pdfium":
+            try:
+                import pypdfium2  # noqa: F401
+            except Exception:
+                print("\n[pdfium] SKIP — pypdfium2 not installed")
+                continue
+        ok = _self_test_engine(template, engine) and ok
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -1606,6 +1778,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="output format (default: xlsx)")
     ap.add_argument("--debug", action="store_true",
                     help="print every extracted field for each page")
+    ap.add_argument("--engine", choices=list(ENGINES), default=DEFAULT_ENGINE,
+                    help="PDF extraction back-end: 'pdfplumber' (default, pure-Python "
+                         "reference) or 'pdfium' (pypdfium2 — several times faster at "
+                         "~the same memory; validate on real data first). Overrides "
+                         "$PARSER_ENGINE.")
     ap.add_argument("--self-test", action="store_true",
                     help="run the parser against the bundled template.pdf and exit")
     ap.add_argument("--inspect", action="store_true",
@@ -1688,7 +1865,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Using region map: {region_map_path} ({len(region_map)} station(s))")
 
     print(f"Parsing {len(paths)} PDF file(s)…")
-    rows, skipped = parse_files(paths, debug=args.debug, region_map=region_map)
+    rows, skipped = parse_files(paths, debug=args.debug, region_map=region_map,
+                                engine=args.engine)
     if not rows:
         print("error: nothing extracted", file=sys.stderr)
         return 1

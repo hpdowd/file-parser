@@ -92,6 +92,10 @@ uv run parse_incidents.py INPUT [INPUT ...] [options]
   -o, --output PATH     output file (default: incidents.xlsx / .csv / .json)
   -f, --format FMT      xlsx (default) | csv | json
   --debug               print every extracted field for each page
+  --engine ENGINE       PDF text back-end: pdfplumber (default, pure-Python) or
+                        pdfium (pypdfium2 — several times faster at ~the same
+                        memory). Both feed identical extraction logic. Also
+                        settable via the PARSER_ENGINE environment variable.
   --inspect             privacy-safe structural report (every value masked)
   --diagnose            check whether the PDF's text is actually extractable
   --self-test           parse the bundled template.pdf and check every *** cell

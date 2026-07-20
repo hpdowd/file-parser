@@ -7,4 +7,5 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.18   # >=0.0.18 fixes the multipart DoS (CVE-2024-53981)
 pdfplumber>=0.11
 openpyxl>=3.1
+pypdfium2>=4              # optional faster extraction back-end (set PARSER_ENGINE=pdfium)
 pyjwt[crypto]>=2.9         # optional in-app Cloudflare Access JWT verification (H2)

@@ -1,3 +1,4 @@
 pdfplumber>=0.11
 openpyxl>=3.1
 cryptography>=42
+pypdfium2>=4      # optional faster extraction back-end (PARSER_ENGINE=pdfium / --engine pdfium)
