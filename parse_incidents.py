@@ -634,6 +634,133 @@ def iter_pdf_paths(inputs: list[str]) -> list[Path]:
     return paths
 
 
+def _extract_pdf(pdf, pdf_path: Path, src_path: str, force: bool,
+                 region_map: Optional[dict[str, tuple[str, str]]],
+                 debug: bool) -> tuple[list[dict], list[dict], bool]:
+    """Stream one already-open PDF a page at a time, returning (rows, skipped,
+    any_matched).
+
+    Memory: never holds more than the current page's PageView, and releases each
+    page's pdfplumber cache (`page.close()`) as soon as we're done with it — so peak
+    memory is ~one page's worth regardless of report length. (The previous version
+    built every page's words/lines/rects up front, which cost ~one page × page-count
+    at once and OOM'd on 200+ page exports.)
+
+    `force` extracts every page rather than skipping continuation/non-incident ones;
+    it's the safety net for a file whose layout matched nothing (see parse_files)."""
+    file_rows: list[dict] = []
+    file_skipped: list[dict] = []
+    any_matched = False
+    # Last-seen value (and stated count) of each nested banner level, reset per file
+    # so one report can't inherit another's groups. Each level is updated whenever
+    # its bar reappears; the dept comes from the innermost (station) bar. Updated on
+    # every page — even skipped ones — so a banner on a continuation page still
+    # carries forward.
+    current = {k: "" for k, _l, _h in BANNER_LEVELS}
+    counts = {k: "" for k, _l, _h in BANNER_LEVELS}
+    dept = ""
+    for i, page in enumerate(pdf.pages, start=1):
+        try:
+            try:
+                pv = PageView(page)
+            except Exception as exc:
+                print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
+                      file=sys.stderr)
+                continue
+            flag = is_incident_page(pv)
+            any_matched = any_matched or flag
+            banners = extract_banners(pv)
+            for key, _l, _h in BANNER_LEVELS:
+                if key in banners:
+                    current[key] = banners[key]["value"]
+                    counts[key] = banners[key]["count"]
+                    if key == "grp_station":
+                        dept = banners[key]["dept"]
+            if banners and debug:
+                print(f"  {pdf_path.name} p{i}: banners -> " + ", ".join(
+                    f"{k}={banners[k]['value']!r}" for k in banners))
+            if not flag and not force:
+                file_skipped.append({"source_file": pdf_path.name, "page": i,
+                                     "source_path": src_path})
+                if debug:
+                    print(f"  {pdf_path.name} p{i}: continuation/non-incident "
+                          "page — skipped")
+                continue
+            try:
+                row = extract_page(pv, pdf_path.name, i, debug)
+                for key, _l, _h in BANNER_LEVELS:
+                    row[key] = current[key]
+                    row[key + "_n"] = counts[key]  # banner-stated count
+                row["grp_dept"] = dept
+                row["source_path"] = src_path
+                # Cross-check the per-incident values against the banner this
+                # row falls under: Incident Type vs grp_type, and the Review
+                # Station's local-station prefix vs grp_station. Any mismatch
+                # raises the "check" flag; the reason(s) are recorded in
+                # check_detail (used by the Discrepancies sheet + a cell note).
+                # Done while the full review-station cell is available; then
+                # reduce that column to its bracketed Review Station value.
+                local, review = _split_review_station(row.get("review_station", ""))
+                issues = []
+                if (current["grp_type"] and row.get("incident_type")
+                        and not _same(row["incident_type"], current["grp_type"])):
+                    issues.append("Incident Type differs from banner")
+                if (current["grp_station"] and local
+                        and not _same(local, current["grp_station"])):
+                    issues.append("Local Station differs from banner")
+                row["check"] = "yes" if issues else ""
+                row["check_detail"] = "; ".join(issues)
+                row["review_station"] = review or row.get("review_station", "")
+
+                # Region matching (Sec 19 only, see load_region_map): the
+                # Local Station banner's region code is appended to the
+                # banner value; the mapped name fills Investigating Member,
+                # which a Sec 19 incident is expected to leave blank. If it
+                # wasn't blank, append instead of overwrite and flag the cell
+                # (see write_xlsx) rather than silently discard what was read.
+                # A Sec 19 station with NO match is flagged too — that's
+                # either an unmapped station or a spelling gap in the map,
+                # and either way the row got no auto-fill, so it needs a
+                # human to look rather than pass silently.
+                if region_map and row.get("sec19") == "Yes":
+                    station = current["grp_station"]
+                    match = region_map.get(_norm(station).casefold())
+                    if match:
+                        code, member_name = match
+                        row["grp_station"] = f"{station} {code}"
+                        row["grp_station_n"] = ""  # split off the banner's count
+                        existing = _norm(row.get("investigating_member", ""))
+                        if not existing or _is_no_data(existing):
+                            row["investigating_member"] = member_name
+                        else:
+                            row["investigating_member"] = f"{existing} / {member_name}"
+                            row["investigating_flag"] = "yes"
+                            row["investigating_flag_detail"] = (
+                                "Investigating Member was already populated "
+                                "on this Sec 19 incident — the region name "
+                                "was appended rather than overwriting it")
+                    elif station:
+                        print(f"warning: {pdf_path.name} p{i}: Sec 19 "
+                              f"incident's Local Station {station!r} not "
+                              "found in region map — leaving unchanged",
+                              file=sys.stderr)
+                        row["investigating_flag"] = "yes"
+                        row["investigating_flag_detail"] = (
+                            f"Sec 19 incident's Local Station {station!r} "
+                            "wasn't matched to a region — no auto-fill "
+                            "applied, please check")
+
+                file_rows.append(row)
+            except Exception as exc:
+                print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
+                      file=sys.stderr)
+        finally:
+            # Release this page's parsed objects/words now that we're done, so
+            # peak memory stays flat across a long report instead of growing.
+            page.close()
+    return file_rows, file_skipped, any_matched
+
+
 def parse_files(paths: list[Path], debug: bool = False,
                 region_map: Optional[dict[str, tuple[str, str]]] = None
                 ) -> tuple[list[dict], list[dict]]:
@@ -649,118 +776,27 @@ def parse_files(paths: list[Path], debug: bool = False,
     rows: list[dict] = []
     skipped: list[dict] = []
     for pdf_path in paths:
+        src_path = str(pdf_path.resolve())  # for the xlsx page hyperlinks
         try:
             with pdfplumber.open(pdf_path) as pdf:
-                views: list[tuple[int, PageView]] = []
-                for i, page in enumerate(pdf.pages, start=1):
-                    try:
-                        views.append((i, PageView(page)))
-                    except Exception as exc:
-                        print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
-                              file=sys.stderr)
-                flags = [is_incident_page(pv) for _, pv in views]
-                # Safety net: never silently drop a whole file. If nothing matched
-                # the expected layout, extract every page rather than emit nothing.
-                force = bool(views) and not any(flags)
-                if force:
-                    print(f"warning: {pdf_path.name}: no page matched the expected "
-                          f"incident layout — extracting all {len(views)} page(s) "
-                          f"anyway. Please share a sample so the parser can be tuned.")
-                # Last-seen value (and stated count) of each nested banner level,
-                # reset per file so one report can't inherit another's groups. Each
-                # level is updated whenever its bar reappears; the dept comes from the
-                # innermost (station) bar. Updated on every page — even skipped ones —
-                # so a banner on a continuation page still carries forward.
-                current = {k: "" for k, _l, _h in BANNER_LEVELS}
-                counts = {k: "" for k, _l, _h in BANNER_LEVELS}
-                dept = ""
-                src_path = str(pdf_path.resolve())  # for the xlsx page hyperlinks
-                for (i, pv), flag in zip(views, flags):
-                    banners = extract_banners(pv)
-                    for key, _l, _h in BANNER_LEVELS:
-                        if key in banners:
-                            current[key] = banners[key]["value"]
-                            counts[key] = banners[key]["count"]
-                            if key == "grp_station":
-                                dept = banners[key]["dept"]
-                    if banners and debug:
-                        print(f"  {pdf_path.name} p{i}: banners -> " + ", ".join(
-                            f"{k}={banners[k]['value']!r}" for k in banners))
-                    if not flag and not force:
-                        skipped.append({"source_file": pdf_path.name, "page": i,
-                                        "source_path": src_path})
-                        if debug:
-                            print(f"  {pdf_path.name} p{i}: continuation/non-incident "
-                                  "page — skipped")
-                        continue
-                    try:
-                        row = extract_page(pv, pdf_path.name, i, debug)
-                        for key, _l, _h in BANNER_LEVELS:
-                            row[key] = current[key]
-                            row[key + "_n"] = counts[key]  # banner-stated count
-                        row["grp_dept"] = dept
-                        row["source_path"] = src_path
-                        # Cross-check the per-incident values against the banner this
-                        # row falls under: Incident Type vs grp_type, and the Review
-                        # Station's local-station prefix vs grp_station. Any mismatch
-                        # raises the "check" flag; the reason(s) are recorded in
-                        # check_detail (used by the Discrepancies sheet + a cell note).
-                        # Done while the full review-station cell is available; then
-                        # reduce that column to its bracketed Review Station value.
-                        local, review = _split_review_station(row.get("review_station", ""))
-                        issues = []
-                        if (current["grp_type"] and row.get("incident_type")
-                                and not _same(row["incident_type"], current["grp_type"])):
-                            issues.append("Incident Type differs from banner")
-                        if (current["grp_station"] and local
-                                and not _same(local, current["grp_station"])):
-                            issues.append("Local Station differs from banner")
-                        row["check"] = "yes" if issues else ""
-                        row["check_detail"] = "; ".join(issues)
-                        row["review_station"] = review or row.get("review_station", "")
-
-                        # Region matching (Sec 19 only, see load_region_map): the
-                        # Local Station banner's region code is appended to the
-                        # banner value; the mapped name fills Investigating Member,
-                        # which a Sec 19 incident is expected to leave blank. If it
-                        # wasn't blank, append instead of overwrite and flag the cell
-                        # (see write_xlsx) rather than silently discard what was read.
-                        # A Sec 19 station with NO match is flagged too — that's
-                        # either an unmapped station or a spelling gap in the map,
-                        # and either way the row got no auto-fill, so it needs a
-                        # human to look rather than pass silently.
-                        if region_map and row.get("sec19") == "Yes":
-                            station = current["grp_station"]
-                            match = region_map.get(_norm(station).casefold())
-                            if match:
-                                code, member_name = match
-                                row["grp_station"] = f"{station} {code}"
-                                row["grp_station_n"] = ""  # split off the banner's count
-                                existing = _norm(row.get("investigating_member", ""))
-                                if not existing or _is_no_data(existing):
-                                    row["investigating_member"] = member_name
-                                else:
-                                    row["investigating_member"] = f"{existing} / {member_name}"
-                                    row["investigating_flag"] = "yes"
-                                    row["investigating_flag_detail"] = (
-                                        "Investigating Member was already populated "
-                                        "on this Sec 19 incident — the region name "
-                                        "was appended rather than overwriting it")
-                            elif station:
-                                print(f"warning: {pdf_path.name} p{i}: Sec 19 "
-                                      f"incident's Local Station {station!r} not "
-                                      "found in region map — leaving unchanged",
-                                      file=sys.stderr)
-                                row["investigating_flag"] = "yes"
-                                row["investigating_flag_detail"] = (
-                                    f"Sec 19 incident's Local Station {station!r} "
-                                    "wasn't matched to a region — no auto-fill "
-                                    "applied, please check")
-
-                        rows.append(row)
-                    except Exception as exc:
-                        print(f"warning: failed on {pdf_path.name} page {i}: {exc}",
-                              file=sys.stderr)
+                n_pages = len(pdf.pages)
+                file_rows, file_skipped, any_matched = _extract_pdf(
+                    pdf, pdf_path, src_path, force=False,
+                    region_map=region_map, debug=debug)
+            # Safety net: never silently drop a whole file. If nothing matched the
+            # expected layout, re-stream the file extracting every page rather than
+            # emit nothing. This is rare (a genuinely unfamiliar layout), so paying a
+            # second pass only here keeps the common path single-pass and flat-memory.
+            if n_pages and not any_matched:
+                print(f"warning: {pdf_path.name}: no page matched the expected "
+                      f"incident layout — extracting all {n_pages} page(s) "
+                      f"anyway. Please share a sample so the parser can be tuned.")
+                with pdfplumber.open(pdf_path) as pdf:
+                    file_rows, file_skipped, _ = _extract_pdf(
+                        pdf, pdf_path, src_path, force=True,
+                        region_map=region_map, debug=debug)
+            rows.extend(file_rows)
+            skipped.extend(file_skipped)
         except Exception as exc:
             print(f"warning: could not open {pdf_path}: {exc}", file=sys.stderr)
     if skipped:
